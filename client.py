@@ -6,18 +6,20 @@ from openai import OpenAI
 
 from base_prompt import BASE_PROMPT
 
-MODEL_NAME = 'gemini-3.1-flash-lite'
+MODEL_NAME = "gemma4:26b"
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 CURRENT_DIR = os.getcwd()
+
+URL_DICT = {
+    "GEMINI": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "OPENAI": "",
+    "ANTHROPIC": "",
+    "OLLAMA": "http://localhost:11434/v1",
+}
 
 
 # from pydantic_ai import Agent, RunContext
 
-# 1. Initialize the unified client pointing to your local Ollama instance
-#client = OpenAI(
-#    base_url="http://localhost:11434/v1",
-#    api_key="ollama"  # Required string parameter by the SDK, though ignored by Ollama
-#)
 
 
 def load_environment_dict() -> str:
@@ -31,18 +33,39 @@ def load_environment_dict() -> str:
 def initialize_client():
     env = load_environment_dict()
 
-    try:
-        api_key = env.get("GEMINI_API_KEY")
-    except Exception as e:
-        print(f"[SYSTEM] Error while loading api key: \n{e}")
-        sys.exit()
+    for key in ["GEMINI_API_KEY", "OPENAI_KEY", "ANTHROPIC_KEY"]:
+        api_key = env.get("GEMINI_API_KEY", "")
+        base_url = URL_DICT.get(key.split("_")[0], "")
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=BASE_URL
-    )
+        if len(api_key) == 0:
+            continue
+        else:
+            try:
+                client = OpenAI(
+                    api_key=api_key,
+                    base_url=base_url
+                )
+                return client
+            except Exception as e:
+                print(f"[ERROR] Could not open client: \n{e}")
+                sys.exit()
+    
+    # Alternatively, use local model as default
+    # TODO: Make switching of local models more intuitive
+    base_url = env.get("OLLAMA_URL", "")
+
+    if len(base_url) == 0:
+        base_url = URL_DICT.get("OLLAMA")
+
+    try:
+        client = OpenAI(
+            base_url= base_url, 
+            api_key="ollama"  # Required string parameter by the SDK, though ignored by Ollama
+        )
+    except Exception as e:
+        print(f"[ERROR] Could not open client: \n{e}")
+        sys.exit()
     return client
 
 
 CLIENT = initialize_client()
-

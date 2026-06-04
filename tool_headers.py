@@ -10,6 +10,7 @@ AVAILABLE_ACTIONS = {
     "extract_image_info": (tool_extract_image_info, ImageAnalyzerArgs),
     "bash_command": (tool_execute_bash_command, BashCommandArgs),
     "search_web": (tool_web_search, WebSearchArgs),
+    "retrieve_RAG": (tool_retrieve_memory, MemoryQueryArgs),
 }
 
 
@@ -70,4 +71,12 @@ TOOL_LIST = [
                 "parameters": WebSearchArgs.model_json_schema()
             }
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "retrieve_RAG",
+                "description": "Local RAG query retrieving relevant memories and learned facts.",
+                "parameters": MemoryQueryArgs.model_json_schema()
+            }
+        }
     ]

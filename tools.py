@@ -14,6 +14,8 @@ from openai import OpenAI
 from typing import Any
 from duckduckgo_search import DDGS
 
+from RAG import db_retrieve
+
 from client import CLIENT, MODEL_NAME
 from base_prompt import BASE_PROMPT
 
@@ -48,8 +50,7 @@ class MemoryInputArgs(BaseModel):
     value: str = Field(description="The value of a given [attribute] associated with a [key.]")
 
 class MemoryQueryArgs(BaseModel):
-    key: str = Field(description="Key to query for associated attributes and values.")
-
+    query: str = Field(description="Query to search in local RAG data base.")
 
 #
 # Core tool functions
@@ -186,3 +187,10 @@ def tool_web_search(args: WebSearchArgs) -> str:
     except Exception as e:
         return f"Error executing web search: {str(e)}"
 
+
+def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
+    try:
+        top_n_hits = db_retrieve(query=args.query)
+        return json.dumps(top_n_hits, indent=2)
+    except Exception as e:
+        return f"Error executing memory search: {str(e)}"
