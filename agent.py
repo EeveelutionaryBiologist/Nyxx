@@ -1,7 +1,11 @@
+
+import json
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
 
 from client import CLIENT, MODEL_NAME
+
+from RAG import db_retrieve
 
 
 def parse_system_prompt(user_input: str, messages: list) -> tuple[bool, bool]:
@@ -58,8 +62,19 @@ def run_agentic_chat():
 
             continue
 
-        # Standard interaction path
-        messages.append({"role": "user", "content": user_input})
+        try:
+            raw_memories = db_retrieve(query=user_input, top_n=3)
+            if raw_memories:
+                memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n{json.dumps(raw_memories, indent=2)}"
+            else:
+                memory_context = ""
+        except Exception as e:
+            print(f"[SYSTEM WARNING] Failed background memory pre-fetch: {e}")
+            memory_context = ""
+
+        # 2. Append to message history, injecting the retrieved facts into the user payload
+        enriched_content = f"{user_input}{memory_context}"
+        messages.append({"role": "user", "content": enriched_content})
 
         # Call local model over unified OpenAI protocol
         response = CLIENT.chat.completions.create(
@@ -68,7 +83,7 @@ def run_agentic_chat():
             tools=tools,
             tool_choice="auto"
         )
-
+        
         response_message = response.choices[0].message
         
         # Handle tool calls 
