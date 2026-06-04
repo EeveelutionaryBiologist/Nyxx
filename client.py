@@ -1,0 +1,48 @@
+
+import os
+import sys
+import json
+from openai import OpenAI
+
+from base_prompt import BASE_PROMPT
+
+MODEL_NAME = 'gemini-3.1-flash-lite'
+BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+CURRENT_DIR = os.getcwd()
+
+
+# from pydantic_ai import Agent, RunContext
+
+# 1. Initialize the unified client pointing to your local Ollama instance
+#client = OpenAI(
+#    base_url="http://localhost:11434/v1",
+#    api_key="ollama"  # Required string parameter by the SDK, though ignored by Ollama
+#)
+
+
+def load_environment_dict() -> str:
+    # TODO: Decoding from encrypt later - right now irrelevant as on local machine
+    with open('env.json') as json_file:
+        data = json.load(json_file)
+
+    return data
+
+
+def initialize_client():
+    env = load_environment_dict()
+
+    try:
+        api_key = env.get("GEMINI_API_KEY")
+    except Exception as e:
+        print(f"[SYSTEM] Error while loading api key: \n{e}")
+        sys.exit()
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=BASE_URL
+    )
+    return client
+
+
+CLIENT = initialize_client()
+
