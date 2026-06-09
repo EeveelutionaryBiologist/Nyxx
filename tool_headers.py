@@ -11,6 +11,7 @@ AVAILABLE_ACTIONS = {
     "bash_command": (tool_execute_bash_command, BashCommandArgs),
     "search_web": (tool_web_search, WebSearchArgs),
     "retrieve_RAG": (tool_retrieve_memory, MemoryQueryArgs),
+    "add_memory_RAG": (tool_commit_to_memory, MemoryInputArgs)
 }
 
 
@@ -77,6 +78,14 @@ TOOL_LIST = [
                 "name": "retrieve_RAG",
                 "description": "Local RAG query retrieving relevant memories and learned facts.",
                 "parameters": MemoryQueryArgs.model_json_schema()
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_memory_RAG",
+                "description": "Add a string to permament memory using the RAG backend. IMPORTANT: Should be phrased in a concise way. Convoluted facts may be broken up into multiple simpler facts/ tool calls.",
+                "parameters": MemoryInputArgs.model_json_schema()
             }
         }
     ]

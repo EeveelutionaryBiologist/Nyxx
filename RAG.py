@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import chromadb
+import uuid
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
@@ -67,11 +68,17 @@ memory_collection = chroma_client.get_or_create_collection(
 # ==========================================
 # UTILITY AND RETRIEVAL FUNCTIONS
 # ==========================================
-def add_chunk_to_db(chunk: str, chunk_id: str, source: str = "user_declaration"):
+def add_chunk_to_db(chunk: str, chunk_id: str = "", source: str = "user_declaration"):
     """Adds a single memory chunk to ChromaDB."""
+    """It is not advised to set ID manually"""
+    if len(chunk_id) > 0:
+        uuid = chunk_id
+    else:
+        uuid = uuid.uuid1()
+
     memory_collection.upsert(
         documents=[chunk],
-        ids=[chunk_id],
+        ids=[uuid],
         metadatas=[{"source": source}]
     )
 
@@ -88,7 +95,7 @@ def initialize_db():
     if memory_collection.count() == 0:
         print("[SYSTEM] Memory database empty. Seeding initial facts...")
         for i, chunk in enumerate(facts_to_learn):
-            add_chunk_to_db(chunk, f"fact_{i}")
+            add_chunk_to_db(chunk)
             print(f"Committed fact #{i}: [{chunk}] to memory.")
     else:
         print(f"[SYSTEM] Loaded {memory_collection.count()} existing memories from disk.")

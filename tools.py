@@ -8,16 +8,24 @@ import subprocess
 import ast
 import operator as op
 
+from pathlib import Path
 from pydantic import BaseModel, Field
 from openai import OpenAI
-
 from typing import Any
 from duckduckgo_search import DDGS
 
-from RAG import db_retrieve
+from RAG import db_retrieve, add_chunk_to_db
 
 from client import CLIENT, MODEL_NAME
 from base_prompt import BASE_PROMPT
+
+
+# Setup a tmp directory - needed for some tool uses
+THIS_DIR = Path(__file__).resolve().parent
+TMP_DIR = THIS_DIR / "tmp"
+
+if not TMP_DIR.exists():
+    TMP_DIR.mkdir()
 
 
 # Using Pydantic to define tool schemas 
@@ -45,9 +53,7 @@ class WebSearchArgs(BaseModel):
     query: str = Field(description="A specific, optimized search query to lookup on the internet.")
 
 class MemoryInputArgs(BaseModel):
-    key: str = Field(description="Key or object that a piece of information is to be associated with. Memorys have the scheme: [key] has [attribute] of [value], i.e. Mark has Hair that is Black.")
-    attribute: str = Field(description="The type of information [value] that is saved for a given [key].")
-    value: str = Field(description="The value of a given [attribute] associated with a [key.]")
+    string: str = Field(description="Information to be retained in permanent memory for later context enrichment (RAG). Should be phrased in a concise way. NOTE: Convoluted facts may be broken up into multiple simpler facts/ tool calls.")
 
 class MemoryQueryArgs(BaseModel):
     query: str = Field(description="Query to search in local RAG data base.")
@@ -194,3 +200,12 @@ def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
         return json.dumps(top_n_hits, indent=2)
     except Exception as e:
         return f"Error executing memory search: {str(e)}"
+
+
+def tool_commit_to_memory(args: MemoryInputArgs) -> str:
+    try:
+        add_chunk_to_db(args.string, source="agent_memory")
+        print(f"[SYSTEM] Added to permanent memory: {args.string}")
+        return "Committed fact to memory."
+    except Exception as e:
+        return f"Error adding memory to ChromaDB: {str(e)}"

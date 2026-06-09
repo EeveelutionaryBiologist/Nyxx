@@ -9,9 +9,9 @@ from client import CLIENT, MODEL_NAME
 from RAG import db_retrieve
 
 
-MAX_CONTEXT_TOKENS = 8192
+MAX_CONTEXT_TOKENS = 16384
 TRIGGER_SUMMARY_TOKENS = int(MAX_CONTEXT_TOKENS * 0.8)  # ~6550 tokens
-TEMPERATURE = 0.4 # Global temp setting, Not used for now
+TEMPERATURE = 0.5 # Global temp setting, Not used for now
 
 # Safety throttle: Prevent a model from getting stuck in an infinite tool-calling loop
 MAX_LOOP_CYCLES = 8
