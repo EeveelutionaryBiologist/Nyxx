@@ -7,7 +7,7 @@ from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
 # ==========================================
-# DYNAMIC PATH INITIALIZATION 
+# DIRECTORY/EMBEDDING MODEL INITIALIZATION 
 # ==========================================
 
 RAG_DIR = Path(__file__).resolve().parent

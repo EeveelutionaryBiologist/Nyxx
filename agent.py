@@ -1,9 +1,9 @@
+import os
 import json
 from pathlib import Path
 from datetime import datetime
-from multiprocessing import Process, Pipe
 
-import toolbox_worker
+from toolbox_worker import ToolWorkerInterface
 from context_handler import ContextHandler
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
@@ -11,20 +11,18 @@ from client import CLIENT, MODEL_NAME
 from RAG import db_retrieve
 
 
-MAX_CONTEXT_TOKENS = 16384
-TRIGGER_SUMMARY_TOKENS = int(MAX_CONTEXT_TOKENS * 0.8)  
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
 
 # Safety throttle: Prevent a model from getting stuck in an infinite tool-calling loop
 MAX_LOOP_CYCLES = 8
 
+CURRENT_DIR = Path(os.getcwd())
+
 # ======================================================================
 # Launch worker process from which tool calls are executed
 # ======================================================================
-parent_conn, child_conn = Pipe()
-worker_process = Process(target=toolbox_worker.listen_and_execute, args=(child_conn,))
-worker_process.start()
-print("[SYSTEM] Tool dispatch worker initialized.")
+worker = ToolWorkerInterface(CURRENT_DIR)
+worker.start()
 
 
 def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tuple[bool, bool]:
@@ -35,9 +33,7 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
     match cmd:
         case 'exit' | 'quit' | 'close' | 'bye':
             terminate = True
-        case 'tokens':
-            n_tokens = context_handler.get_total_tokens()
-            print(f"[SYSTEM] Estimated current token usage: {n_tokens}")
+            worker.shutdown()
         case 'clear':
             context_handler.clear()
         case 'log':
@@ -68,7 +64,7 @@ def run_agentic_chat():
                 print("[SYSTEM] Unknown system prompt (?)")
                 continue
             if terminate: 
-                print("[SYSTEM] Shutdown signal received. \nGoodbye!")
+                print("[SYSTEM] System shutting down. \nGoodbye!")
                 break
             continue
 
@@ -124,12 +120,7 @@ def run_agentic_chat():
                     })
                     continue
 
-                # Pack and send the payload across the pipeline
-                payload = json.dumps({"name": func_name, "arguments": tool_call.function.arguments})
-                parent_conn.send(payload)
-
-                # Block-read the answer
-                response_payload = json.loads(parent_conn.recv())
+                response_payload = worker.dispatch(func_name, tool_call.function.arguments)
 
                 if response_payload["status"] == "success":
                     action_result = response_payload["data"]
