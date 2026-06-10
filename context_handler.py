@@ -3,6 +3,8 @@ from typing import Any
 
 from base_prompt import BASE_PROMPT
 
+MAX_CONTEXT_TOKENS = 16384
+TRIGGER_SUMMARY_TOKENS = int(MAX_CONTEXT_TOKENS * 0.8)  
 
 class ContextHandler:
     def __init__(self):
