@@ -10,8 +10,8 @@ AVAILABLE_ACTIONS = {
     "extract_image_info": (tool_extract_image_info, ImageAnalyzerArgs),
     "bash_command": (tool_execute_bash_command, BashCommandArgs),
     "search_web": (tool_web_search, WebSearchArgs),
-    "retrieve_RAG": (tool_retrieve_memory, MemoryQueryArgs),
-    "add_memory_RAG": (tool_commit_to_memory, MemoryInputArgs)
+    # "retrieve_RAG": (tool_retrieve_memory, MemoryQueryArgs),
+    "add_persistent_memory": (tool_commit_to_memory, MemoryInputArgs)
 }
 
 
@@ -83,7 +83,7 @@ TOOL_LIST = [
         {
             "type": "function",
             "function": {
-                "name": "add_memory_RAG",
+                "name": "add_persistent_memory",
                 "description": "Add a string to permament memory using the RAG backend. IMPORTANT: Should be phrased in a concise way. Convoluted facts may be broken up into multiple simpler facts/ tool calls.",
                 "parameters": MemoryInputArgs.model_json_schema()
             }

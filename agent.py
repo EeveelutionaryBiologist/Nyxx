@@ -8,7 +8,7 @@ from context_handler import ContextHandler
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
 from client import CLIENT, MODEL_NAME
-from RAG import db_retrieve
+from RAG import ChromaDBInterface
 
 
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
@@ -19,12 +19,21 @@ MAX_LOOP_CYCLES = 8
 CURRENT_DIR = Path(os.getcwd())
 
 # ======================================================================
+# startup ChromaDB & interface
+# ======================================================================
+memory_interface = ChromaDBInterface()
+memory_interface.initialize_db()
+
+# ======================================================================
 # Launch worker process from which tool calls are executed
 # ======================================================================
 worker = ToolWorkerInterface(CURRENT_DIR)
 worker.start()
 
 
+# ======================================================================
+# Main functions
+# ======================================================================
 def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tuple[bool, bool]:
     cmd = user_input.strip('/').lower()
     terminate = False
@@ -58,6 +67,9 @@ def run_agentic_chat():
         if not user_input:
             continue
 
+        # ========================================================
+        # Handle System-level input
+        # ========================================================
         if user_input[0] == "/":
             ok, terminate = parse_system_prompt(user_input, context_handler)
             if not ok:
@@ -68,9 +80,11 @@ def run_agentic_chat():
                 break
             continue
 
-        # Passive CPU RAG Injection
+        # ========================================================
+        # Passive CPU RAG injection -> retireve relevant memory chunks
+        # ========================================================
         try:
-            raw_memories = db_retrieve(query=user_input, top_n=3)
+            raw_memories = memory_interface.db_retrieve(query=user_input, top_n=3)
             if raw_memories:
                 memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n{json.dumps(raw_memories, indent=2)}"
             else:
@@ -81,8 +95,12 @@ def run_agentic_chat():
 
         enriched_content = f"{user_input}{memory_context}"
         context_handler.append_messages({"role": "user", "content": enriched_content})
+
+        # ========================================================
+        # Dispatch messages to Black Box model, handle response
+        # ========================================================
         cycle_count = 0
-        
+
         while cycle_count < MAX_LOOP_CYCLES:
             cycle_count += 1
             
@@ -124,6 +142,15 @@ def run_agentic_chat():
 
                 if response_payload["status"] == "success":
                     action_result = response_payload["data"]
+                elif response_payload["status"] == "REQUEST_PARENT_WRITE":
+                    print(response_payload)
+                    try:
+                        fact_to_write = response_payload["payload"]
+                        memory_interface.add_chunk_to_db(chunk=fact_to_write, source="agent")
+                        print("Length:", memory_interface.db_length())
+                        action_result = f"[SUCCESS] Parent process committed fact to ChromaDB. Current size: {memory_interface.db_length()}"
+                    except Exception as e:
+                        action_result = f"[SYSTEM ERROR] Parent failed database write: {e}"
                 else:
                     action_result = f"[PROCESS ISOLATION ERROR]: {response_payload['message']}"
 

@@ -35,15 +35,16 @@ if not GGUF_MODEL_PATH.exists():
 
 
 # ==========================================
-# CHROMADB & CPU EMBEDDING SETUP
+# CPU EMBEDDING HANDLER
 # ==========================================
+
 class LocalCPUEmbedding(EmbeddingFunction[Documents]):
     def __init__(self, model_path: str):
         print("[SYSTEM] Initializing standalone CPU embedding worker...")
         self.model = Llama(
             model_path=model_path,
             embedding=True,
-            n_gpu_layers=0,  # 100% CPU isolated, saving VRAM
+            n_gpu_layers=0,  
             verbose=False
         )
 
@@ -54,33 +55,63 @@ class LocalCPUEmbedding(EmbeddingFunction[Documents]):
             results.append(output["data"][0]["embedding"])
         return results
 
-# Spin up persistent client using absolute path strings
-chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
-cpu_ef = LocalCPUEmbedding(model_path=str(GGUF_MODEL_PATH))
-
-memory_collection = chroma_client.get_or_create_collection(
-    name="agent_memories",
-    embedding_function=cpu_ef,
-    metadata={"hnsw:space": "cosine"}
-)
-
 
 # ==========================================
-# UTILITY AND RETRIEVAL FUNCTIONS
+# CHROMADB HANDLER
 # ==========================================
-def add_chunk_to_db(chunk: str, chunk_id: str = "", source: str = "user_declaration"):
-    """Adds a single memory chunk to ChromaDB."""
-    """It is not advised to set ID manually"""
-    if len(chunk_id) > 0:
-        uuid = chunk_id
-    else:
-        uuid = uuid.uuid1()
 
-    memory_collection.upsert(
-        documents=[chunk],
-        ids=[uuid],
-        metadatas=[{"source": source}]
-    )
+class ChromaDBInterface:
+    def __init__(self):
+        self.db_path = CHROMA_PATH
+        self.cpu_ef = LocalCPUEmbedding(model_path=str(GGUF_MODEL_PATH))
+        self.chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
+        self.memory_collection = self.chroma_client.get_or_create_collection(
+            name="agent_memories",
+            embedding_function=self.cpu_ef,
+            metadata={"hnsw:space": "cosine"}
+        )
+    
+    # ==========================================
+    # UTILITY AND RETRIEVAL FUNCTIONS
+    # ==========================================
+    def add_chunk_to_db(self, chunk: str, chunk_id: str = "", source: str = "user_declaration"):
+        """Adds a single memory chunk to ChromaDB."""
+        """It is not advised to set ID manually"""
+        if len(chunk_id) > 0:
+            local_uuid = chunk_id
+        else:
+            local_uuid = uuid.uuid1()
+
+        self.memory_collection.upsert(
+            documents=[chunk],
+            ids=[str(local_uuid)],
+            metadatas=[{"source": source}]
+        )
+
+    def db_retrieve(self, query: str, top_n: int = 5) -> list[str]:
+        results = self.memory_collection.query(
+            query_texts=[query],
+            n_results=top_n
+        )
+        if results and "documents" in results and results["documents"]:
+            return results["documents"][0]
+        return []
+
+    def initialize_db(self):
+        """Seeds the DB if it is currently empty."""
+        facts_to_learn = parse_facts_to_learn()
+
+        if self.memory_collection.count() == 0:
+            print("[SYSTEM] Memory database empty. Seeding initial facts...")
+            for i, chunk in enumerate(facts_to_learn):
+                self.add_chunk_to_db(chunk)
+                print(f"Committed fact #{i}: [{chunk}] to memory.")
+        else:
+            print(f"[SYSTEM] Loaded {self.memory_collection.count()} existing memories from disk.")
+
+    def db_length(self):
+        return self.memory_collection.count()
+    
 
 def parse_facts_to_learn():
     with open(FACTS_PATH / "facts.txt", 'r') as f:
@@ -88,30 +119,4 @@ def parse_facts_to_learn():
     return parsed_facts
 
 
-def initialize_db():
-    """Seeds the DB if it is currently empty."""
-    facts_to_learn = parse_facts_to_learn()
-
-    if memory_collection.count() == 0:
-        print("[SYSTEM] Memory database empty. Seeding initial facts...")
-        for i, chunk in enumerate(facts_to_learn):
-            add_chunk_to_db(chunk)
-            print(f"Committed fact #{i}: [{chunk}] to memory.")
-    else:
-        print(f"[SYSTEM] Loaded {memory_collection.count()} existing memories from disk.")
-
-
-def db_retrieve(query: str, top_n: int = 5) -> list[str]:
-    """Queries ChromaDB using the custom CPU function and extracts match rows."""
-    # print(f"Querying Memory Index: '{query}'")
-    
-    results = memory_collection.query(
-        query_texts=[query],
-        n_results=top_n
-    )
-    if results and "documents" in results and results["documents"]:
-        return results["documents"][0]
-    return []
-
-# Execute startup setup checklist
-initialize_db()
+# initialize_db()

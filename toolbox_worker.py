@@ -6,13 +6,20 @@ import json
 from multiprocessing import Process, Pipe
 
 from tool_headers import AVAILABLE_ACTIONS
+from tools import MemoryInputArgs
 
 
 class ToolWorkerInterface:
     def __init__(self, directory):
         self.parent_conn, self.child_conn = Pipe()
-        self.worker_process = Process(target=listen_and_execute, args=(self.child_conn,))
+        
+        # Pass memory_interface to args mapping tuple
+        self.worker_process = Process(
+            target=listen_and_execute, 
+            args=(self.child_conn,)
+        )
         self.current_directory = directory
+        # self.memory_interface = memory_interface
         print("[SYSTEM] Tool dispatch worker initialized.")
 
     def start(self):
@@ -22,6 +29,7 @@ class ToolWorkerInterface:
         # Pack and send the payload across the pipeline
         payload = json.dumps({"name": func_name, "arguments": arguments})
         self.parent_conn.send(payload)
+        print(payload)
 
         # Block-read the answer
         response_payload = json.loads(self.parent_conn.recv())
@@ -51,24 +59,33 @@ def listen_and_execute(pipe_connection):
     
     while True:
         try:
-            # Wait for the main agent process to send a tool task
-            request_raw = pipe_connection.recv()  # Block-waits for incoming data
+            request_raw = pipe_connection.recv()
             request = json.loads(request_raw)
             
-            # Handling of termination signal
             if request.get("name") == "SIG_SHUTDOWN":
                 print("[WORKER] Exit signal received. Cleaning up...", flush=True)
-                
-                # TODO: Run any database close routines or file flushes here
                 break
             
             func_name = request["name"]
             arguments_str = request["arguments"]
-            
+
             if func_name in AVAILABLE_ACTIONS:
+
+                # If the model wants to write to persitent DB, intercept here
+                if func_name == "add_persistent_memory":
+                    # Decode what the model wanted to save
+                    parsed_args = MemoryInputArgs.model_validate_json(arguments_str)
+                    
+                    # Signal the parent process to do the write operation
+                    pipe_connection.send(json.dumps({
+                        "status": "REQUEST_PARENT_WRITE", 
+                        "payload": parsed_args.string
+                    }))
+                    continue
+
                 func_executor, pydantic_schema = AVAILABLE_ACTIONS[func_name]
                 
-                # Parse and run inside the isolated process space
+                # Unpack arguments and send off to function
                 parsed_args = pydantic_schema.model_validate_json(arguments_str)
                 result = func_executor(parsed_args)
                 
@@ -77,5 +94,5 @@ def listen_and_execute(pipe_connection):
                 pipe_connection.send(json.dumps({"status": "error", "message": f"Unknown tool: {func_name}"}))
                 
         except Exception as e:
-            # If a tool crashes, send back the error report
             pipe_connection.send(json.dumps({"status": "error", "message": str(e)}))
+            

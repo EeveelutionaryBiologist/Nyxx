@@ -14,7 +14,7 @@ from openai import OpenAI
 from typing import Any
 from duckduckgo_search import DDGS
 
-from RAG import db_retrieve, add_chunk_to_db
+# from RAG import db_retrieve, add_chunk_to_db
 
 from client import CLIENT, MODEL_NAME
 from base_prompt import BASE_PROMPT
@@ -196,7 +196,7 @@ def tool_web_search(args: WebSearchArgs) -> str:
 
 def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
     try:
-        top_n_hits = db_retrieve(query=args.query)
+        top_n_hits = memory_interface.db_retrieve(query=args.query)
         return json.dumps(top_n_hits, indent=2)
     except Exception as e:
         return f"Error executing memory search: {str(e)}"
@@ -204,8 +204,7 @@ def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
 
 def tool_commit_to_memory(args: MemoryInputArgs) -> str:
     try:
-        add_chunk_to_db(args.string, source="agent_memory")
-        print(f"[SYSTEM] Added to permanent memory: {args.string}")
-        return "Committed fact to memory."
+        memory_interface.add_chunk_to_db(chunk=args.string, source="agent")
+        return f"[SUCCESS] Fact successfully committed to local persistent storage memory. Current total keys: {memory_interface.db_length()}"
     except Exception as e:
-        return f"Error adding memory to ChromaDB: {str(e)}"
+        return f"[SYSTEM ERROR] Failed committing fact to ChromaDB: {str(e)}"
