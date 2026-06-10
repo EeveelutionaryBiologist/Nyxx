@@ -47,6 +47,16 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
             context_handler.clear()
         case 'log':
             context_handler.dump_chat_log()
+        case 'forgetall':
+            user_input = input("[SYSTEM] This action is irreversible. Continue? [y/n]").strip()
+            if user_input in ['y', 'Y']:
+                for entry in memory_interface.get_all_memories():
+                    memory_interface.delete_chunk_from_db(entry.get("id"))
+            memory_interface.initialize_db()
+        case 'dumpmemory' | 'writememory':
+            print("id\ttext\tmetadata")
+            for entry in memory_interface.get_all_memories():
+                print(f"{entry.get("id")}\n{entry.get("text")}\n{entry.get("metadata")}")
         case _:
             ok = False
     
@@ -84,7 +94,7 @@ def run_agentic_chat():
         # Passive CPU RAG injection -> retireve relevant memory chunks
         # ========================================================
         try:
-            raw_memories = memory_interface.db_retrieve(query=user_input, top_n=3)
+            raw_memories = memory_interface.db_retrieve(query=user_input, top_n=5)
             if raw_memories:
                 memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n{json.dumps(raw_memories, indent=2)}"
             else:

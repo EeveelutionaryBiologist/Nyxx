@@ -19,7 +19,6 @@ class ToolWorkerInterface:
             args=(self.child_conn,)
         )
         self.current_directory = directory
-        # self.memory_interface = memory_interface
         print("[SYSTEM] Tool dispatch worker initialized.")
 
     def start(self):
@@ -37,15 +36,15 @@ class ToolWorkerInterface:
 
     def shutdown(self):
         print("[SYSTEM] Signalling worker process to halt...")
-        # Option A: Send a poison pill message that the worker loop checks for
+        # Send a poison pill message that the worker loop checks for
         try:
             self.parent_conn.send(json.dumps({"name": "SIG_SHUTDOWN", "arguments": "{}"}))
         except Exception as e:
             print(e)
-        # Wait for worker process to clean up -
-        time.sleep(2)
+        # Give worker process a second to clean up -
+        time.sleep(1)
         
-        # Option B: Forcefully kill it from the OS layer if it ignores the signal
+        # Option B: Forcefully kill the worker from the OS layer if it ignores the signal
         if self.worker_process.is_alive():
             self.worker_process.terminate() # Sends SIGTERM natively
             self.worker_process.join()      # Wait for OS resource cleanup to finish

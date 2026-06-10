@@ -97,6 +97,14 @@ class ChromaDBInterface:
             return results["documents"][0]
         return []
 
+    def delete_chunk_from_db(self, chunk_id: str):
+        """Removes a specific entry from ChromaDB using its ID."""
+        try:
+            self.memory_collection.delete(ids=[chunk_id])
+            print(f"[SYSTEM] Successfully deleted memory with ID: {chunk_id}")
+        except Exception as e:
+            print(f"[ERROR] Failed to delete entry {chunk_id}: {e}")
+
     def initialize_db(self):
         """Seeds the DB if it is currently empty."""
         facts_to_learn = parse_facts_to_learn()
@@ -111,6 +119,18 @@ class ChromaDBInterface:
 
     def db_length(self):
         return self.memory_collection.count()
+
+    def get_all_memories(self):
+        """Retrieves all documents and their metadata from the collection."""
+        # include=['documents', 'metadatas'] ensures you get the text and the source info
+        results = self.memory_collection.get(include=['documents', 'metadatas'])
+        if results['documents']:
+            # Zip them together into a more readable format (e.g., list of dicts)
+            return [
+                {"id": doc_id, "text": doc, "metadata": meta}
+                for doc_id, doc, meta in zip(results['ids'], results['documents'], results['metadatas'])
+            ]
+        return []
     
 
 def parse_facts_to_learn():

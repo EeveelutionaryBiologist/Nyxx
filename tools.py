@@ -23,10 +23,13 @@ from base_prompt import BASE_PROMPT
 # Setup a tmp directory - needed for some tool uses
 THIS_DIR = Path(__file__).resolve().parent
 TMP_DIR = THIS_DIR / "tmp"
+ERROR_DIR = THIS_DIR / "errors"
 
 if not TMP_DIR.exists():
     TMP_DIR.mkdir()
 
+if not ERROR_DIR.exists():
+    ERROR_DIR.mkdir()
 
 # Using Pydantic to define tool schemas 
 class FileReadArgs(BaseModel):
