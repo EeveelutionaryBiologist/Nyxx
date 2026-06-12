@@ -5,8 +5,6 @@ import json
 from pathlib import Path
 from openai import OpenAI
 
-from base_prompt import THIS_DIR
-
 
 THIS_DIR = Path(__file__).resolve().parent
 
