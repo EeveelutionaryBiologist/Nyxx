@@ -11,8 +11,18 @@ import chromadb
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
+from librarian import load_librarian_model, consolidate_memory_to_graph
+from knowledge_graph import KnowledgeRelationshipGraph
+
+
 # ==========================================
-# 1. SETUP & CONFIGURATION
+# 0. Initialize Librarian model & knowledge realtionship graph
+# ==========================================
+load_librarian_model()
+global_graph = KnowledgeRelationshipGraph("Memory/knowledge_graph.json")
+
+# ==========================================
+# 1. DIRECTORY SETUP & CONFIGURATION
 # ==========================================
 app = FastAPI(title="Nyxx Memory Microservice")
 
@@ -170,17 +180,31 @@ def trigger_consolidation():
     and synthesize them using an LLM.
     """
     cursor = sqlite_conn.cursor()
+
+    # TODO: Query up all memories that are related to the current one
+
     # Example: Find all memories accessed more than 5 times
     cursor.execute("SELECT id, content, hit_count FROM memories WHERE hit_count > 5")
     frequent_memories = cursor.fetchall()
     
     # TODO: Implement LLM summarization and clustering logic here
-    
+
+    # new_memory = "I just got a new golden retriever named Max. He chewed up my leather shoes."
+    # consolidate_memory_to_graph(new_memory, global_graph)
+    try:
+        consolidate_memory_to_graph("TEST", global_graph)
+    except Exception as err:
+        return {
+            "status": "failure", 
+            "message": f"Memory consolidation failed with error code: {err}.",
+            "frequent_memories_found": len(frequent_memories)
+        }
+        
     return {
-        "status": "pending", 
-        "message": "Consolidation logic under construction.",
-        "frequent_memories_found": len(frequent_memories)
-    }
+            "status": "success", 
+            "message": "[SYSTEM] Knowledge graph updated.",
+            "frequent_memories_found": len(frequent_memories)
+        }
 
 @app.get("/memory/all")
 def get_all_memories():

@@ -92,7 +92,7 @@ def consolidate_memory_to_graph(memory_text: str, kg: KnowledgeRelationshipGraph
     
     if not triples:
         print("[LIBRARIAN] No actionable relations found to map.")
-        return
+        return 
         
     for triple in triples:
         kg.add_relationship(triple.subject, triple.predicate, triple.object)
