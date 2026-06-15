@@ -66,10 +66,16 @@ def load_embedding_model():
         hf_hub_download(
             repo_id="CompendiumLabs/bge-base-en-v1.5-gguf",
             filename="bge-base-en-v1.5-f16.gguf",
-            local_dir=EMBEDDING_DIR
+            local_dir=EMBEDDING_DIR,
         )
     print("[SYSTEM] Initializing Llama.cpp Embedder...")
-    embedder = Llama(model_path=str(GGUF_MODEL_PATH), embedding=True, verbose=False)
+    embedder = Llama(
+        model_path=str(GGUF_MODEL_PATH), 
+        n_gpu_layers=0,
+        embedding=True, 
+        verbose=False,
+        use_mlock=True,
+    )
 
 def get_embedding(text: str) -> list[float]:
     """Generates a vector embedding for a given text."""
