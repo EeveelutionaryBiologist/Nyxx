@@ -7,6 +7,7 @@ import mimetypes
 import subprocess
 import ast
 import operator as op
+import requests
 
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -19,6 +20,7 @@ from duckduckgo_search import DDGS
 from client import CLIENT, MODEL_NAME
 from base_prompt import BASE_PROMPT
 
+MEMORY_SERVER_URL = "http://localhost:8000"
 
 # Setup a tmp directory - needed for some tool uses
 THIS_DIR = Path(__file__).resolve().parent
@@ -197,17 +199,25 @@ def tool_web_search(args: WebSearchArgs) -> str:
         return f"Error executing web search: {str(e)}"
 
 
-def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
-    try:
-        top_n_hits = memory_interface.db_retrieve(query=args.query)
-        return json.dumps(top_n_hits, indent=2)
-    except Exception as e:
-        return f"Error executing memory search: {str(e)}"
-
-
 def tool_commit_to_memory(args: MemoryInputArgs) -> str:
     try:
-        memory_interface.add_chunk_to_db(chunk=args.string, source="agent")
-        return f"[SUCCESS] Fact successfully committed to local persistent storage memory. Current total keys: {memory_interface.db_length()}"
+        response = requests.post(f"{MEMORY_SERVER_URL}/memory/add", json={"text": args.string})
+        response.raise_for_status()
+        return "[SUCCESS] Information has been permanently committed to memory."
     except Exception as e:
-        return f"[SYSTEM ERROR] Failed committing fact to ChromaDB: {str(e)}"
+        return f"[ERROR] Failed to save memory: {str(e)}"
+
+def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
+    try:
+        response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": args.query, "top_k": 3})
+        response.raise_for_status()
+        data = response.json()
+        
+        # Format the output for the LLM, explicitly including the hit counter!
+        formatted_results = []
+        for res in data["results"]:
+            formatted_results.append(f"Fact: {res['text']} (Accessed {res['hit_count']} times before)")
+            
+        return "\n".join(formatted_results)
+    except Exception as e:
+        return f"[ERROR] Failed to search memory: {str(e)}"

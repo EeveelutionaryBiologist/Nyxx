@@ -1,5 +1,7 @@
+
 import os
 import json
+import requests
 from pathlib import Path
 from datetime import datetime
 
@@ -8,7 +10,6 @@ from context_handler import ContextHandler
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
 from client import CLIENT, MODEL_NAME
-from RAG import ChromaDBInterface
 
 
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
@@ -18,18 +19,14 @@ MAX_LOOP_CYCLES = 8
 
 CURRENT_DIR = Path(os.getcwd())
 
-# ======================================================================
-# startup ChromaDB & interface
-# ======================================================================
-memory_interface = ChromaDBInterface()
-memory_interface.initialize_db()
+# The URL where our new Memory Microservice is hosted
+MEMORY_SERVER_URL = "http://localhost:8000"
 
 # ======================================================================
 # Launch worker process from which tool calls are executed
 # ======================================================================
 worker = ToolWorkerInterface(CURRENT_DIR)
 worker.start()
-
 
 # ======================================================================
 # Main functions
@@ -48,15 +45,28 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
         case 'log':
             context_handler.dump_chat_log()
         case 'forgetall':
-            user_input = input("[SYSTEM] This action is irreversible. Continue? [y/n]").strip()
-            if user_input in ['y', 'Y']:
-                for entry in memory_interface.get_all_memories():
-                    memory_interface.delete_chunk_from_db(entry.get("id"))
-            memory_interface.initialize_db()
+            confirm = input("[SYSTEM] This action is irreversible. Continue? [y/n]").strip()
+            if confirm in ['y', 'Y']:
+                try:
+                    response = requests.delete(f"{MEMORY_SERVER_URL}/memory/clear")
+                    response.raise_for_status()
+                    print("[SYSTEM] Database completely wiped.")
+                except Exception as e:
+                    print(f"[SYSTEM ERROR] Failed to wipe memory: {e}")
+                    
         case 'dumpmemory' | 'writememory':
-            print("id\ttext\tmetadata")
-            for entry in memory_interface.get_all_memories():
-                print(f"{entry.get("id")}\n{entry.get("text")}\n{entry.get("metadata")}")
+            try:
+                response = requests.get(f"{MEMORY_SERVER_URL}/memory/all")
+                response.raise_for_status()
+                memories = response.json().get("results", [])
+                
+                print("ID\tHITS\tCREATED_AT\tTEXT")
+                print("-" * 60)
+                for entry in memories:
+                    print(f"{entry['id'][:8]}...\t{entry['hit_count']}\t{entry['created_at'][:10]}\t{entry['text']}")
+                print(f"[SYSTEM] Total records: {len(memories)}")
+            except Exception as e:
+                print(f"[SYSTEM ERROR] Could not retrieve memories: {e}")
         case _:
             ok = False
     
@@ -91,14 +101,24 @@ def run_agentic_chat():
             continue
 
         # ========================================================
-        # Passive CPU RAG injection -> retireve relevant memory chunks
+        # Passive Microservice RAG injection -> retrieve relevant memory chunks
         # ========================================================
         try:
-            raw_memories = memory_interface.db_retrieve(query=user_input, top_n=5)
-            if raw_memories:
-                memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n{json.dumps(raw_memories, indent=2)}"
+            response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": user_input, "top_k": 5})
+            if response.status_code == 200:
+                raw_memories = response.json().get("results", [])
+                if raw_memories:
+                    # We inject the text AND the hit_counter to give the model context on how important this is
+                    formatted_mems = [f"- {m['text']} (Hits: {m['hit_count']})" for m in raw_memories]
+                    memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n" + "\n".join(formatted_mems)
+                else:
+                    memory_context = ""
             else:
                 memory_context = ""
+        except requests.exceptions.ConnectionError:
+            # Don't crash the chat if the memory server is offline, just warn the user once
+            print("[SYSTEM WARNING] Memory Server unreachable. RAG is currently disabled.")
+            memory_context = ""
         except Exception as e:
             print(f"[SYSTEM WARNING] Failed background memory pre-fetch: {e}")
             memory_context = ""
@@ -139,7 +159,6 @@ def run_agentic_chat():
                 print(f"─► Requesting remote execution for '{func_name}'")
 
                 if not func_name in AVAILABLE_ACTIONS:
-                    # Inform the model natively if it hallucinates an invalid action name
                     context_handler.append_messages({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -153,12 +172,12 @@ def run_agentic_chat():
                 if response_payload["status"] == "success":
                     action_result = response_payload["data"]
                 elif response_payload["status"] == "REQUEST_PARENT_WRITE":
-                    print(response_payload)
+                    # Adapt the parent write to use the HTTP Server instead of ChromaDB directly
                     try:
                         fact_to_write = response_payload["payload"]
-                        memory_interface.add_chunk_to_db(chunk=fact_to_write, source="agent")
-                        print("Length:", memory_interface.db_length())
-                        action_result = f"[SUCCESS] Parent process committed fact to ChromaDB. Current size: {memory_interface.db_length()}"
+                        res = requests.post(f"{MEMORY_SERVER_URL}/memory/add", json={"text": fact_to_write})
+                        res.raise_for_status()
+                        action_result = f"[SUCCESS] Parent process committed fact to Memory Microservice."
                     except Exception as e:
                         action_result = f"[SYSTEM ERROR] Parent failed database write: {e}"
                 else:
