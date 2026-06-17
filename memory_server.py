@@ -1,4 +1,3 @@
-
 import os
 import uuid
 import sqlite3
@@ -11,22 +10,20 @@ import chromadb
 from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
-from librarian import load_librarian_model, consolidate_memory_to_graph
+from librarian import (
+    load_librarian_model, 
+    process_memory_chunk, 
+    extract_entities_from_text, 
+    librarian_summarize
+)
 from knowledge_graph import KnowledgeRelationshipGraph
 
-
-# ==========================================
-# 0. Initialize Librarian model & knowledge realtionship graph
-# ==========================================
-load_librarian_model()
-global_graph = KnowledgeRelationshipGraph("Memory/knowledge_graph.json")
 
 # ==========================================
 # 1. DIRECTORY SETUP & CONFIGURATION
 # ==========================================
 app = FastAPI(title="Nyxx Memory Microservice")
 
-# Directories based on your existing architecture
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_DIR = BASE_DIR / "Memory"
 CHROMA_PATH = MEMORY_DIR / "chromadb"
@@ -34,16 +31,45 @@ SQLITE_PATH = MEMORY_DIR / "metadata.db"
 EMBEDDING_DIR = BASE_DIR / "Embedding"
 GGUF_MODEL_PATH = EMBEDDING_DIR / "bge-base-en-v1.5-f16.gguf"
 
-# Ensure directories exist
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 EMBEDDING_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==========================================
-# 2. DATABASE INITIALIZATION
+# 2. INITIALIZE MODELS & GRAPH
+# ==========================================
+embedder = None
+
+@app.on_event("startup")
+def startup_event():
+    """Runs on Uvicorn startup."""
+    global embedder
+    
+    # Load Embedding Model
+    if not GGUF_MODEL_PATH.exists():
+        print("[SYSTEM] Downloading embedding model...")
+        hf_hub_download(
+            repo_id="CompendiumLabs/bge-base-en-v1.5-gguf",
+            filename="bge-base-en-v1.5-f16.gguf",
+            local_dir=EMBEDDING_DIR
+        )
+    print("[SYSTEM] Initializing Llama.cpp Embedder...")
+    embedder = Llama(model_path=str(GGUF_MODEL_PATH), embedding=True, verbose=False)
+    
+    # Load background Librarian
+    load_librarian_model()
+
+def get_embedding(text: str) -> list[float]:
+    response = embedder.create_embedding(text)
+    return response["data"][0]["embedding"]
+
+# Initialize Knowledge Graph
+knowledge_graph = KnowledgeRelationshipGraph(str(MEMORY_DIR / "knowledge_graph.json"))
+
+# ==========================================
+# 3. DATABASE INITIALIZATION
 # ==========================================
 def init_sqlite():
-    """Creates the SQLite database for metadata and hit-counters if it doesn't exist."""
-    # Add check_same_thread=False here!
+    # check_same_thread=False is critical to prevent FastAPI threading crashes
     conn = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''
@@ -58,39 +84,9 @@ def init_sqlite():
     conn.commit()
     return conn
 
-# Global variables for DB connections and models
 sqlite_conn = init_sqlite()
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = chroma_client.get_or_create_collection(name="nyxx_memory")
-embedder = None
-
-# ==========================================
-# 3. EMBEDDING MODEL SETUP
-# ==========================================
-@app.on_event("startup")
-def load_embedding_model():
-    """Downloads (if necessary) and loads the local embedding model on server startup."""
-    global embedder
-    if not GGUF_MODEL_PATH.exists():
-        print("[SYSTEM] Downloading embedding model...")
-        hf_hub_download(
-            repo_id="CompendiumLabs/bge-base-en-v1.5-gguf",
-            filename="bge-base-en-v1.5-f16.gguf",
-            local_dir=EMBEDDING_DIR,
-        )
-    print("[SYSTEM] Initializing Llama.cpp Embedder...")
-    embedder = Llama(
-        model_path=str(GGUF_MODEL_PATH), 
-        n_gpu_layers=0,
-        embedding=True, 
-        verbose=False,
-        use_mlock=True,
-    )
-
-def get_embedding(text: str) -> list[float]:
-    """Generates a vector embedding for a given text."""
-    response = embedder.create_embedding(text)
-    return response["data"][0]["embedding"]
 
 # ==========================================
 # 4. API ENDPOINTS
@@ -104,107 +100,100 @@ class SearchQuery(BaseModel):
 
 @app.post("/memory/add")
 def add_memory(memory: MemoryInput):
-    """Saves a new memory into both ChromaDB and SQLite."""
-    mem_id = str(uuid.uuid4())
+    """Processes raw text via Librarian, saving Atomic facts to ChromaDB and Triples to Graph."""
     now = datetime.now().isoformat()
-    
-    # 1. Generate Embedding
-    vector = get_embedding(memory.text)
-    
-    # 2. Save to ChromaDB (for vector search)
-    collection.add(
-        embeddings=[vector],
-        documents=[memory.text],
-        ids=[mem_id]
-    )
-    
-    # 3. Save to SQLite (for metadata & hit counter)
     cursor = sqlite_conn.cursor()
+    
+    # 1. Ask Librarian to process the chunk
+    processed_data = process_memory_chunk(memory.text)
+    if not processed_data:
+        raise HTTPException(status_code=500, detail="Librarian failed to process memory.")
+
+    # 2. Store original raw chunk in SQLite just for posterity
+    raw_id = str(uuid.uuid4())
     cursor.execute(
         "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-        (mem_id, memory.text, now, now)
+        (raw_id, memory.text, now, now)
     )
     sqlite_conn.commit()
+
+    # 3. Save Atomic Facts to ChromaDB & SQLite
+    for fact in processed_data.atomic_facts:
+        fact_id = str(uuid.uuid4())
+        vector = get_embedding(fact)
+        
+        collection.add(
+            embeddings=[vector],
+            documents=[fact],
+            ids=[fact_id]
+        )
+        cursor.execute(
+            "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+            (fact_id, fact, now, now)
+        )
+    sqlite_conn.commit()
+
+    # 4. Save Triples to Knowledge Graph
+    for triple in processed_data.triples:
+        knowledge_graph.add_relationship(triple.subject, triple.predicate, triple.object)
+        print(f"  -> Graph Mapped: {triple.subject} [{triple.predicate}] {triple.object}")
     
-    return {"status": "success", "id": mem_id, "message": "Memory added."}
+    return {
+        "status": "success", 
+        "message": f"Added {len(processed_data.atomic_facts)} standalone facts and {len(processed_data.triples)} graph relations."
+    }
 
 @app.post("/memory/search")
 def search_memory(search: SearchQuery):
-    """Searches for memories and increments their hit-counter."""
-    # 1. Generate query embedding
-    query_vector = get_embedding(search.query)
+    """Searches ChromaDB (vectors) and Knowledge Graph (relations)."""
+    now = datetime.now().isoformat()
+    cursor = sqlite_conn.cursor()
     
-    # 2. Search in ChromaDB
+    # --- 1. VECTOR SEARCH ---
+    query_vector = get_embedding(search.query)
     results = collection.query(
         query_embeddings=[query_vector],
         n_results=search.top_k
     )
     
-    if not results['ids'] or not results['ids'][0]:
-        return {"results": []}
-    
-    found_ids = results['ids'][0]
-    now = datetime.now().isoformat()
     final_results = []
-    
-    # 3. Retrieve metadata from SQLite and update hit-counter
-    cursor = sqlite_conn.cursor()
-    for mem_id in found_ids:
-        # Increment the counter and update the timestamp
-        cursor.execute("""
-            UPDATE memories 
-            SET hit_count = hit_count + 1, last_accessed = ? 
-            WHERE id = ?
-        """, (now, mem_id))
-        sqlite_conn.commit()
-        
-        # Fetch the updated row
-        cursor.execute("SELECT content, hit_count, created_at FROM memories WHERE id = ?", (mem_id,))
-        row = cursor.fetchone()
-        
-        if row:
-            final_results.append({
-                "id": mem_id,
-                "text": row[0],
-                "hit_count": row[1],
-                "created_at": row[2]
-            })
+    if results['ids'] and results['ids'][0]:
+        for mem_id in results['ids'][0]:
+            cursor.execute("""
+                UPDATE memories 
+                SET hit_count = hit_count + 1, last_accessed = ? 
+                WHERE id = ?
+            """, (now, mem_id))
+            sqlite_conn.commit()
             
-    return {"results": final_results}
+            cursor.execute("SELECT content, hit_count FROM memories WHERE id = ?", (mem_id,))
+            row = cursor.fetchone()
+            if row:
+                final_results.append({
+                    "text": row[0],
+                    "hit_count": row[1]
+                })
 
-@app.post("/memory/consolidate")
-def trigger_consolidation():
-    """
-    Placeholder endpoint for Memory Consolidation.
-    This will eventually iterate over SQLite, find high-hit memories, 
-    and synthesize them using an LLM.
-    """
-    cursor = sqlite_conn.cursor()
-
-    # TODO: Query up all memories that are related to the current one
-
-    # Example: Find all memories accessed more than 5 times
-    cursor.execute("SELECT id, content, hit_count FROM memories WHERE hit_count > 5")
-    frequent_memories = cursor.fetchall()
+    # --- 2. GRAPH RETRIEVAL ---
+    relation_facts = [] # Initialize safely
+    extracted = extract_entities_from_text(search.query)
     
-    # TODO: Implement LLM summarization and clustering logic here
-
-    # new_memory = "I just got a new golden retriever named Max. He chewed up my leather shoes."
-    # consolidate_memory_to_graph(new_memory, global_graph)
-    try:
-        consolidate_memory_to_graph("TEST", global_graph)
-    except Exception as err:
-        return {
-            "status": "failure", 
-            "message": f"Memory consolidation failed with error code: {err}.",
-            "frequent_memories_found": len(frequent_memories)
-        }
+    if extracted and hasattr(extracted, 'entities'):
+        for entity in extracted.entities:
+            facts = knowledge_graph.retrieve_relationships(entity.name, depth=1)
+            if facts:
+                relation_facts.extend(facts)
+    
+    summarized_context = ""
+    if relation_facts:
+        unique_facts = list(set(relation_facts)) # Deduplicate facts before summary
+        # summarized_context = librarian_summarize(unique_facts) # <--- This eats quite a lot of power...
+        summarized_context = "\n".join(unique_facts)
         
     return {
-            "status": "success", 
-            "message": "[SYSTEM] Knowledge graph updated.",
-            "frequent_memories_found": len(frequent_memories)
-        }
+        "results": final_results,
+        "relational_context": summarized_context
+    }
 
 @app.get("/memory/all")
 def get_all_memories():
@@ -212,29 +201,23 @@ def get_all_memories():
     cursor = sqlite_conn.cursor()
     cursor.execute("SELECT id, content, hit_count, created_at FROM memories ORDER BY created_at DESC")
     rows = cursor.fetchall()
-    
-    results = []
-    for row in rows:
-        results.append({
-            "id": row[0],
-            "text": row[1],
-            "hit_count": row[2],
-            "created_at": row[3]
-        })
-    return {"results": results}
+    return {"results": [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3]} for r in rows]}
 
 @app.delete("/memory/clear")
 def clear_all_memories():
-    """Wipes both ChromaDB and SQLite databases completely."""
+    """Wipes ChromaDB, SQLite, and the Knowledge Graph completely."""
     # 1. Clear SQLite
     cursor = sqlite_conn.cursor()
     cursor.execute("DELETE FROM memories")
     sqlite_conn.commit()
     
     # 2. Clear ChromaDB
-    # ChromaDB doesn't have a simple 'delete all' without IDs, so we delete and recreate the collection
     global collection
     chroma_client.delete_collection("nyxx_memory")
     collection = chroma_client.create_collection("nyxx_memory")
     
-    return {"status": "success", "message": "All memories deleted."}
+    # 3. Clear Graph
+    knowledge_graph.G.clear()
+    knowledge_graph.write_graph()
+    
+    return {"status": "success", "message": "All databases and graphs wiped clean."}

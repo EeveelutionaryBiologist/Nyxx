@@ -1,4 +1,3 @@
-
 import os
 import json
 import requests
@@ -10,7 +9,6 @@ from context_handler import ContextHandler
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
 from client import CLIENT, MODEL_NAME
-
 
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
 
@@ -45,12 +43,12 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
         case 'log':
             context_handler.dump_chat_log()
         case 'forgetall':
-            confirm = input("[SYSTEM] This action is irreversible. Continue? [y/n]").strip()
+            confirm = input("[SYSTEM] This action is irreversible. Continue? [y/n] ").strip()
             if confirm in ['y', 'Y']:
                 try:
                     response = requests.delete(f"{MEMORY_SERVER_URL}/memory/clear")
                     response.raise_for_status()
-                    print("[SYSTEM] Database completely wiped.")
+                    print("[SYSTEM] Database and Knowledge Graph completely wiped.")
                 except Exception as e:
                     print(f"[SYSTEM ERROR] Failed to wipe memory: {e}")
                     
@@ -101,28 +99,41 @@ def run_agentic_chat():
             continue
 
         # ========================================================
-        # Passive Microservice RAG injection -> retrieve relevant memory chunks
+        # Passive Microservice RAG injection (Hybrid Graph + Vector)
         # ========================================================
         try:
             response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": user_input, "top_k": 5})
             if response.status_code == 200:
-                raw_memories = response.json().get("results", [])
+                data = response.json()
+                raw_memories = data.get("results", [])
+                relational_context = data.get("relational_context", "")
+                
+                memory_blocks = []
+                
+                # 1. Inject Semantic / Vector Facts
                 if raw_memories:
-                    # We inject the text AND the hit_counter to give the model context on how important this is
                     formatted_mems = [f"- {m['text']} (Hits: {m['hit_count']})" for m in raw_memories]
-                    memory_context = f"\n\n[LOCAL MEMORY CONTEXT]\n" + "\n".join(formatted_mems)
+                    memory_blocks.append("[SEMANTIC MEMORIES]\n" + "\n".join(formatted_mems))
+                
+                # 2. Inject Graph Summaries
+                if relational_context:
+                    memory_blocks.append("[RELATIONAL KNOWLEDGE]\n" + relational_context.strip())
+                
+                # Combine them cleanly
+                if memory_blocks:
+                    memory_context = "\n\n=== RECALLED CONTEXT ===\n" + "\n\n".join(memory_blocks) + "\n========================"
                 else:
                     memory_context = ""
             else:
                 memory_context = ""
         except requests.exceptions.ConnectionError:
-            # Don't crash the chat if the memory server is offline, just warn the user once
             print("[SYSTEM WARNING] Memory Server unreachable. RAG is currently disabled.")
             memory_context = ""
         except Exception as e:
             print(f"[SYSTEM WARNING] Failed background memory pre-fetch: {e}")
             memory_context = ""
 
+        # Append the user input along with the hidden memory context
         enriched_content = f"{user_input}{memory_context}"
         context_handler.append_messages({"role": "user", "content": enriched_content})
 
@@ -172,14 +183,14 @@ def run_agentic_chat():
                 if response_payload["status"] == "success":
                     action_result = response_payload["data"]
                 elif response_payload["status"] == "REQUEST_PARENT_WRITE":
-                    # Adapt the parent write to use the HTTP Server instead of ChromaDB directly
+                    cycle_count -= 1  # Memory addition ops shouldn't bloat the safety loop counter
                     try:
                         fact_to_write = response_payload["payload"]
                         res = requests.post(f"{MEMORY_SERVER_URL}/memory/add", json={"text": fact_to_write})
                         res.raise_for_status()
-                        action_result = f"[SUCCESS] Parent process committed fact to Memory Microservice."
+                        action_result = f"[SUCCESS] Fact successfully committed to Memory Microservice."
                     except Exception as e:
-                        action_result = f"[SYSTEM ERROR] Parent failed database write: {e}"
+                        action_result = f"[SYSTEM ERROR] Failed database write: {e}"
                 else:
                     action_result = f"[PROCESS ISOLATION ERROR]: {response_payload['message']}"
 
@@ -194,3 +205,4 @@ def run_agentic_chat():
             warning_msg = "[SYSTEM] Warning - Throttled! Agent exceeded max autonomous thinking steps safety cap."
             print(warning_msg)
             context_handler.append_messages({"role": "system", "content": warning_msg})
+            

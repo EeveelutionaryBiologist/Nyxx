@@ -19,14 +19,26 @@ class KnowledgeRelationshipGraph:
     def retrieve_relationships(self, node_name: str, depth: int = 1) -> list[str]:
         """
         Yields information pieces formatted for the LLM context.
-        E.g., "User [OWNS] Max", "Max [CHEWS_ON] Shoes"
+        Includes a case-insensitive fallback search.
         """
-        # If the graph doesn't know this entity, return nothing
-        if not self.G.has_node(node_name):
-            return []
+        target_node = node_name
+        
+        # Exact match first (fastest)
+        if not self.G.has_node(target_node):
+            # Fallback: case-insensitive search
+            lower_name = node_name.lower()
+            found = False
+            for existing_node in self.G.nodes():
+                if str(existing_node).lower() == lower_name:
+                    target_node = existing_node
+                    found = True
+                    break
+                    
+            if not found:
+                return []
 
         # ego_graph extracts the target node and all neighbors within the 'depth' radius
-        subgraph = nx.ego_graph(self.G, node_name, radius=depth, undirected=False)
+        subgraph = nx.ego_graph(self.G, target_node, radius=depth, undirected=False)
         
         extracted_facts = []
         for source, target, data in subgraph.edges(data=True):
@@ -36,12 +48,13 @@ class KnowledgeRelationshipGraph:
         return extracted_facts
 
     def add_relationship(self, subject: str, predicate: str, object_: str):
-        # NetworkX handles duplicates automatically; adding an existing node does nothing
+        # NetworkX handles duplicates automatically
         self.G.add_node(subject)
         self.G.add_node(object_)
         
         # Add or update the edge with the relationship predicate
         self.G.add_edge(subject, object_, relation=predicate)
+        self.write_graph()
 
     def remove_relationship(self, subject: str, object_: str):
         """Removes an edge, and cleans up orphaned nodes if they are left floating."""
@@ -53,6 +66,8 @@ class KnowledgeRelationshipGraph:
                 self.G.remove_node(subject)
             if self.G.degree(object_) == 0:
                 self.G.remove_node(object_)
+            
+            self.write_graph()
 
     def write_graph(self):
         with open(self.filepath, 'w') as outfile:
@@ -66,4 +81,3 @@ class KnowledgeRelationshipGraph:
             predicate = data.get('relation', 'RELATES_TO')
             facts.append(f"{source} [{predicate}] {target}")
         return facts
-    
