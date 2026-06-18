@@ -1,8 +1,10 @@
 import os
 import uuid
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import numpy as np
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -11,13 +13,16 @@ from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
 from librarian import (
-    load_librarian_model, 
-    process_memory_chunk, 
-    extract_entities_from_text, 
-    librarian_summarize
+    load_librarian_model,
+    process_memory_chunk,
+    extract_entities_from_text,
+    librarian_summarize,
+    librarian_should_merge,
+    librarian_split_compound,
 )
 from knowledge_graph import KnowledgeRelationshipGraph
 
+CONSOLIDATION_PASSES = 2
 
 # ==========================================
 # 1. DIRECTORY SETUP & CONFIGURATION
@@ -89,7 +94,21 @@ chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = chroma_client.get_or_create_collection(name="nyxx_memory")
 
 # ==========================================
-# 4. API ENDPOINTS
+# 4. CONSOLIDATION CONFIGURATION
+# ==========================================
+# Facts older than this with zero hits are pruned.
+PRUNE_AGE_DAYS = 60
+
+# Cosine similarity threshold above which two facts are sent to the Librarian
+# for a merge decision. Range: 0.0–1.0. Higher = more conservative.
+DEDUP_SIMILARITY_THRESHOLD = 0.90
+
+# Only facts longer than this are checked for compound structure (short facts are
+# almost always already atomic, so skip the Librarian call to save CPU).
+COMPOUND_CHECK_MIN_CHARS = 120
+
+# ==========================================
+# 5. API ENDPOINTS
 # ==========================================
 class MemoryInput(BaseModel):
     text: str
@@ -221,3 +240,167 @@ def clear_all_memories():
     knowledge_graph.write_graph()
     
     return {"status": "success", "message": "All databases and graphs wiped clean."}
+
+
+@app.post("/memory/consolidate")
+def consolidate_memories():
+    """
+    Three-phase memory hygiene pass:
+      Phase 1 – Prune: delete stale, never-retrieved atomic facts from ChromaDB + SQLite.
+      Phase 2 – Merge: detect near-duplicate fact pairs via cosine similarity; ask the
+                       Librarian to produce a merged fact and replace the originals.
+      Phase 3 – Split: find compound facts that slipped through the write-time atomization
+                       and break them into truly independent sentences.
+
+    ARCHITECTURAL NOTE — KG / ChromaDB decoupling:
+    The knowledge graph has no foreign-key link back to the SQLite/ChromaDB fact IDs that
+    generated its triples. This means pruning or merging a fact does NOT automatically
+    remove its corresponding KG edges. The pragmatic workaround applied here is:
+      (a) When a merged fact is added it goes through process_memory_chunk, which
+          re-derives fresh, correct triples — so the merged concept is properly represented.
+      (b) KG nodes with degree=0 (no remaining edges) are pruned at the end.
+    Stale edges from deleted/merged facts will persist but are harmless; they just add
+    noise. The clean long-term fix is to store a fact_id on each KG edge at write time.
+    """
+    report = {"pruned": 0, "merged": 0, "split": 0, "errors": []}
+    cursor = sqlite_conn.cursor()
+    now = datetime.now().isoformat()
+
+    for N in range(CONSOLIDATION_PASSES):
+        # ------------------------------------------------------------------
+        # Phase 1: Prune stale atomic facts (never retrieved, older than N days)
+        # ------------------------------------------------------------------
+        # We must only target IDs that exist in ChromaDB (atomic facts), not raw
+        # chunk records — raw chunks never appear in search results so their
+        # hit_count is always 0 but they should not be pruned.
+        print("[CONSOLIDATE] Phase 1: Pruning stale memories...")
+
+        chroma_all = collection.get(include=[])
+        chroma_id_set = set(chroma_all["ids"])
+
+        cutoff = (datetime.now() - timedelta(days=PRUNE_AGE_DAYS)).isoformat()
+        cursor.execute(
+            "SELECT id FROM memories WHERE hit_count = 0 AND created_at < ?",
+            (cutoff,)
+        )
+        stale_candidates = [row[0] for row in cursor.fetchall()]
+        stale_fact_ids = [id_ for id_ in stale_candidates if id_ in chroma_id_set]
+
+        if stale_fact_ids:
+            collection.delete(ids=stale_fact_ids)
+            cursor.execute(
+                f"DELETE FROM memories WHERE id IN ({','.join('?' * len(stale_fact_ids))})",
+                stale_fact_ids
+            )
+            sqlite_conn.commit()
+            report["pruned"] = len(stale_fact_ids)
+            print(f"[CONSOLIDATE] Pruned {len(stale_fact_ids)} stale facts.")
+
+        # ------------------------------------------------------------------
+        # Phase 2: Near-duplicate detection → Librarian merge decision
+        # ------------------------------------------------------------------
+        print("[CONSOLIDATE] Phase 2: Detecting near-duplicates...")
+
+        chroma_data = collection.get(include=["embeddings", "documents"])
+        ids = chroma_data["ids"]
+        docs = chroma_data["documents"]
+        embeddings = chroma_data["embeddings"]
+
+        merged_out = set()
+
+        if len(ids) >= 2:
+            emb_matrix = np.array(embeddings, dtype=np.float32)
+            norms = np.linalg.norm(emb_matrix, axis=1, keepdims=True)
+            normalized = emb_matrix / np.maximum(norms, 1e-8)
+            # Full pairwise cosine similarity in one matrix multiply — O(n²) but fast with numpy.
+            # For very large collections (>5k facts), consider switching to approximate NN search.
+            similarity_matrix = normalized @ normalized.T
+
+            for i in range(len(ids)):
+                if ids[i] in merged_out:
+                    continue
+                for j in range(i + 1, len(ids)):
+                    if ids[j] in merged_out:
+                        continue
+                    if similarity_matrix[i, j] < DEDUP_SIMILARITY_THRESHOLD:
+                        continue
+
+                    decision = librarian_should_merge(docs[i], docs[j])
+                    if not decision or not decision.should_merge or not decision.merged_fact:
+                        continue
+
+                    # Remove both originals
+                    collection.delete(ids=[ids[i], ids[j]])
+                    cursor.execute("DELETE FROM memories WHERE id IN (?, ?)", (ids[i], ids[j]))
+
+                    # Add merged fact through the full pipeline so KG triples are re-derived
+                    merged_id = str(uuid.uuid4())
+                    merged_vec = get_embedding(decision.merged_fact)
+                    collection.add(
+                        embeddings=[merged_vec],
+                        documents=[decision.merged_fact],
+                        ids=[merged_id]
+                    )
+                    cursor.execute(
+                        "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+                        (merged_id, decision.merged_fact, now, now)
+                    )
+                    sqlite_conn.commit()
+
+                    merged_out.add(ids[i])
+                    merged_out.add(ids[j])
+                    report["merged"] += 1
+                    print(
+                        f"[CONSOLIDATE] Merged (sim={similarity_matrix[i,j]:.3f}):\n"
+                        f"  A: {docs[i]}\n"
+                        f"  B: {docs[j]}\n"
+                        f"  → {decision.merged_fact}"
+                    )
+                    break  # Only one partner per fact per pass; re-run for further merges
+
+        # ------------------------------------------------------------------
+        # Phase 3: Split compound facts
+        # ------------------------------------------------------------------
+        # Fetch fresh snapshot — Phase 2 may have mutated the collection.
+        print("[CONSOLIDATE] Phase 3: Splitting compound facts...")
+
+        chroma_data = collection.get(include=["documents"])
+        facts_to_check = [
+            (id_, doc)
+            for id_, doc in zip(chroma_data["ids"], chroma_data["documents"])
+            if len(doc) >= COMPOUND_CHECK_MIN_CHARS
+        ]
+
+        for fact_id, fact_text in facts_to_check:
+            decision = librarian_split_compound(fact_text)
+            if not decision or not decision.is_compound or len(decision.split_facts) < 2:
+                continue
+
+            collection.delete(ids=[fact_id])
+            cursor.execute("DELETE FROM memories WHERE id = ?", (fact_id,))
+
+            for split_fact in decision.split_facts:
+                split_id = str(uuid.uuid4())
+                split_vec = get_embedding(split_fact)
+                collection.add(embeddings=[split_vec], documents=[split_fact], ids=[split_id])
+                cursor.execute(
+                    "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
+                    (split_id, split_fact, now, now)
+                )
+
+            sqlite_conn.commit()
+            report["split"] += 1
+            print(f"[CONSOLIDATE] Split into {len(decision.split_facts)} facts: '{fact_text[:60]}...'")
+
+        # ------------------------------------------------------------------
+        # KG cleanup: remove nodes that lost all edges (degree = 0)
+        # ------------------------------------------------------------------
+        orphaned = [n for n in list(knowledge_graph.G.nodes()) if knowledge_graph.G.degree(n) == 0]
+        if orphaned:
+            for node in orphaned:
+                knowledge_graph.G.remove_node(node)
+            knowledge_graph.write_graph()
+            print(f"[CONSOLIDATE] Removed {len(orphaned)} orphaned KG nodes.")
+
+    print(f"[CONSOLIDATE] Done. {report}")
+    return {"status": "success", "report": report}

@@ -52,6 +52,21 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                 except Exception as e:
                     print(f"[SYSTEM ERROR] Failed to wipe memory: {e}")
                     
+        case 'consolidate':
+            try:
+                print("[SYSTEM] Running memory consolidation (this may take a while)...")
+                response = requests.post(f"{MEMORY_SERVER_URL}/memory/consolidate")
+                response.raise_for_status()
+                result = response.json().get("report", {})
+                print(
+                    f"[SYSTEM] Consolidation complete. "
+                    f"Pruned: {result.get('pruned', 0)}, "
+                    f"Merged: {result.get('merged', 0)}, "
+                    f"Split: {result.get('split', 0)}"
+                )
+            except Exception as e:
+                print(f"[SYSTEM ERROR] Consolidation failed: {e}")
+
         case 'dumpmemory' | 'writememory':
             try:
                 response = requests.get(f"{MEMORY_SERVER_URL}/memory/all")
