@@ -103,6 +103,10 @@ PRUNE_AGE_DAYS = 60
 # for a merge decision. Range: 0.0–1.0. Higher = more conservative.
 DEDUP_SIMILARITY_THRESHOLD = 0.90
 
+# Above this threshold the facts are considered near-identical text; the Librarian
+# is skipped and the lower-hit-count copy is dropped directly.
+HIGH_SIM_DEDUP_THRESHOLD = 0.99
+
 # Only facts longer than this are checked for compound structure (short facts are
 # almost always already atomic, so skip the Librarian call to save CPU).
 COMPOUND_CHECK_MIN_CHARS = 120
@@ -268,15 +272,75 @@ def consolidate_memories():
 
     for N in range(CONSOLIDATION_PASSES):
         # ------------------------------------------------------------------
+        # Phase 0: Exact-text dedup across SQLite
+        # ------------------------------------------------------------------
+        # The raw chunk written on add_memory() and its derived atomic fact share
+        # the same text but different UUIDs. Phase 2's cosine similarity pass only
+        # sees ChromaDB entries, so it never finds the raw-chunk copy. This pass
+        # finds text duplicates directly in SQLite and drops them, preferring the
+        # ChromaDB-backed (atomic fact) copy over raw-chunk-only copies.
+        print("[CONSOLIDATE] Phase 0: Exact-text dedup in SQLite...")
+
+        chroma_all = collection.get(include=[])
+        chroma_id_set = set(chroma_all["ids"])
+
+        cursor.execute("""
+            SELECT content, GROUP_CONCAT(id, '|') as ids
+            FROM memories
+            GROUP BY content
+            HAVING COUNT(*) > 1
+        """)
+        text_dup_groups = cursor.fetchall()
+
+        for content, ids_str in text_dup_groups:
+            all_ids = ids_str.split("|")
+            in_chroma = [id_ for id_ in all_ids if id_ in chroma_id_set]
+            sqlite_only = [id_ for id_ in all_ids if id_ not in chroma_id_set]
+
+            if in_chroma:
+                # Keep the best ChromaDB-backed copy, drop everything else
+                cursor.execute(
+                    f"SELECT id, hit_count FROM memories WHERE id IN ({','.join('?' * len(in_chroma))})",
+                    in_chroma
+                )
+                chroma_rows = sorted(cursor.fetchall(), key=lambda r: r[1], reverse=True)
+                keep_id = chroma_rows[0][0]
+                drop_ids = [r[0] for r in chroma_rows[1:]] + sqlite_only
+            else:
+                cursor.execute(
+                    f"SELECT id, hit_count FROM memories WHERE id IN ({','.join('?' * len(all_ids))})",
+                    all_ids
+                )
+                rows_sorted = sorted(cursor.fetchall(), key=lambda r: r[1], reverse=True)
+                keep_id = rows_sorted[0][0]
+                drop_ids = [r[0] for r in rows_sorted[1:]]
+
+            if not drop_ids:
+                continue
+
+            chroma_drop = [id_ for id_ in drop_ids if id_ in chroma_id_set]
+            if chroma_drop:
+                collection.delete(ids=chroma_drop)
+
+            cursor.execute(
+                f"DELETE FROM memories WHERE id IN ({','.join('?' * len(drop_ids))})",
+                drop_ids
+            )
+            sqlite_conn.commit()
+            report["merged"] += len(drop_ids)
+            print(f"[CONSOLIDATE] Exact-text dedup: dropped {len(drop_ids)} copy/copies of '{content[:60]}'")
+
+        # Re-fetch chroma_id_set after potential deletions above
+        chroma_all = collection.get(include=[])
+        chroma_id_set = set(chroma_all["ids"])
+
+        # ------------------------------------------------------------------
         # Phase 1: Prune stale atomic facts (never retrieved, older than N days)
         # ------------------------------------------------------------------
         # We must only target IDs that exist in ChromaDB (atomic facts), not raw
         # chunk records — raw chunks never appear in search results so their
         # hit_count is always 0 but they should not be pruned.
         print("[CONSOLIDATE] Phase 1: Pruning stale memories...")
-
-        chroma_all = collection.get(include=[])
-        chroma_id_set = set(chroma_all["ids"])
 
         cutoff = (datetime.now() - timedelta(days=PRUNE_AGE_DAYS)).isoformat()
         cursor.execute(
@@ -322,9 +386,32 @@ def consolidate_memories():
                 for j in range(i + 1, len(ids)):
                     if ids[j] in merged_out:
                         continue
-                    if similarity_matrix[i, j] < DEDUP_SIMILARITY_THRESHOLD:
+                    sim = float(similarity_matrix[i, j])
+                    if sim < DEDUP_SIMILARITY_THRESHOLD:
                         continue
 
+                    if sim >= HIGH_SIM_DEDUP_THRESHOLD:
+                        # Near-identical text — Librarian would likely return an empty merged_fact
+                        # for two identical strings. Skip it; just drop the lower-hit copy.
+                        cursor.execute("SELECT hit_count FROM memories WHERE id = ?", (ids[i],))
+                        row_i = cursor.fetchone()
+                        cursor.execute("SELECT hit_count FROM memories WHERE id = ?", (ids[j],))
+                        row_j = cursor.fetchone()
+                        hits_i = row_i[0] if row_i else 0
+                        hits_j = row_j[0] if row_j else 0
+
+                        drop_id = ids[j] if hits_i >= hits_j else ids[i]
+                        collection.delete(ids=[drop_id])
+                        cursor.execute("DELETE FROM memories WHERE id = ?", (drop_id,))
+                        sqlite_conn.commit()
+
+                        merged_out.add(ids[i])
+                        merged_out.add(ids[j])
+                        report["merged"] += 1
+                        print(f"[CONSOLIDATE] Deduped exact duplicate (sim={sim:.3f}): '{docs[i][:70]}'")
+                        break
+
+                    # Medium similarity — ask the Librarian whether these are truly redundant
                     decision = librarian_should_merge(docs[i], docs[j])
                     if not decision or not decision.should_merge or not decision.merged_fact:
                         continue
@@ -351,7 +438,7 @@ def consolidate_memories():
                     merged_out.add(ids[j])
                     report["merged"] += 1
                     print(
-                        f"[CONSOLIDATE] Merged (sim={similarity_matrix[i,j]:.3f}):\n"
+                        f"[CONSOLIDATE] Merged (sim={sim:.3f}):\n"
                         f"  A: {docs[i]}\n"
                         f"  B: {docs[j]}\n"
                         f"  → {decision.merged_fact}"
