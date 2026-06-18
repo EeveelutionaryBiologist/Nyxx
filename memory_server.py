@@ -62,6 +62,7 @@ def startup_event():
     
     # Load background Librarian
     load_librarian_model()
+    _backfill_record_types()
 
 def get_embedding(text: str) -> list[float]:
     response = embedder.create_embedding(text)
@@ -87,11 +88,43 @@ def init_sqlite():
         )
     ''')
     conn.commit()
+
+    # Migration: add record_type column if this is an existing database
+    try:
+        cursor.execute("ALTER TABLE memories ADD COLUMN record_type TEXT DEFAULT 'fact'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
     return conn
 
 sqlite_conn = init_sqlite()
 chroma_client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 collection = chroma_client.get_or_create_collection(name="nyxx_memory")
+
+def _backfill_record_types():
+    """
+    One-time migration for databases created before the record_type column existed.
+    Any SQLite record whose ID is not in ChromaDB is a raw chunk — tag it 'raw'.
+    Runs at startup; safe to call multiple times (no-op if already tagged).
+    """
+    cursor = sqlite_conn.cursor()
+    cursor.execute("SELECT id FROM memories WHERE record_type = 'fact' OR record_type IS NULL")
+    candidates = [row[0] for row in cursor.fetchall()]
+    if not candidates:
+        return
+
+    chroma_data = collection.get(include=[])
+    chroma_ids = set(chroma_data["ids"])
+
+    sqlite_only = [id_ for id_ in candidates if id_ not in chroma_ids]
+    if sqlite_only:
+        cursor.execute(
+            f"UPDATE memories SET record_type='raw' WHERE id IN ({','.join('?' * len(sqlite_only))})",
+            sqlite_only
+        )
+        sqlite_conn.commit()
+        print(f"[SYSTEM] Backfilled {len(sqlite_only)} existing records as record_type='raw'.")
 
 # ==========================================
 # 4. CONSOLIDATION CONFIGURATION
@@ -132,33 +165,34 @@ def add_memory(memory: MemoryInput):
     if not processed_data:
         raise HTTPException(status_code=500, detail="Librarian failed to process memory.")
 
-    # 2. Store original raw chunk in SQLite just for posterity
+    # 2. Store original raw chunk in SQLite (provenance record, not indexed in ChromaDB)
     raw_id = str(uuid.uuid4())
     cursor.execute(
-        "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-        (raw_id, memory.text, now, now)
+        "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
+        (raw_id, memory.text, now, now, 'raw')
     )
     sqlite_conn.commit()
 
     # 3. Save Atomic Facts to ChromaDB & SQLite
+    fact_ids_batch = []
     for fact in processed_data.atomic_facts:
         fact_id = str(uuid.uuid4())
+        fact_ids_batch.append(fact_id)
         vector = get_embedding(fact)
-        
-        collection.add(
-            embeddings=[vector],
-            documents=[fact],
-            ids=[fact_id]
-        )
+
+        collection.add(embeddings=[vector], documents=[fact], ids=[fact_id])
         cursor.execute(
-            "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-            (fact_id, fact, now, now)
+            "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
+            (fact_id, fact, now, now, 'fact')
         )
     sqlite_conn.commit()
 
-    # 4. Save Triples to Knowledge Graph
+    # 4. Save Triples to Knowledge Graph, linked to this batch's fact IDs
     for triple in processed_data.triples:
-        knowledge_graph.add_relationship(triple.subject, triple.predicate, triple.object)
+        knowledge_graph.add_relationship(
+            triple.subject, triple.predicate, triple.object,
+            fact_ids=fact_ids_batch
+        )
         print(f"  -> Graph Mapped: {triple.subject} [{triple.predicate}] {triple.object}")
     
     return {
@@ -222,9 +256,9 @@ def search_memory(search: SearchQuery):
 def get_all_memories():
     """Retrieves all memories currently stored in the SQLite database."""
     cursor = sqlite_conn.cursor()
-    cursor.execute("SELECT id, content, hit_count, created_at FROM memories ORDER BY created_at DESC")
+    cursor.execute("SELECT id, content, hit_count, created_at, record_type FROM memories ORDER BY created_at DESC")
     rows = cursor.fetchall()
-    return {"results": [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3]} for r in rows]}
+    return {"results": [{"id": r[0], "text": r[1], "hit_count": r[2], "created_at": r[3], "record_type": r[4]} for r in rows]}
 
 @app.delete("/memory/clear")
 def clear_all_memories():
@@ -256,15 +290,10 @@ def consolidate_memories():
       Phase 3 – Split: find compound facts that slipped through the write-time atomization
                        and break them into truly independent sentences.
 
-    ARCHITECTURAL NOTE — KG / ChromaDB decoupling:
-    The knowledge graph has no foreign-key link back to the SQLite/ChromaDB fact IDs that
-    generated its triples. This means pruning or merging a fact does NOT automatically
-    remove its corresponding KG edges. The pragmatic workaround applied here is:
-      (a) When a merged fact is added it goes through process_memory_chunk, which
-          re-derives fresh, correct triples — so the merged concept is properly represented.
-      (b) KG nodes with degree=0 (no remaining edges) are pruned at the end.
-    Stale edges from deleted/merged facts will persist but are harmless; they just add
-    noise. The clean long-term fix is to store a fact_id on each KG edge at write time.
+    KG source tracking: each KG edge stores source_fact_ids. Deleting a fact calls
+    knowledge_graph.remove_fact_reference(), which removes it from all edges and deletes
+    edges whose source list becomes empty. Legacy edges (no source_fact_ids) are left
+    in place and cleaned up by the degree=0 orphan sweep at the end of each pass.
     """
     report = {"pruned": 0, "merged": 0, "split": 0, "errors": []}
     cursor = sqlite_conn.cursor()
@@ -274,53 +303,45 @@ def consolidate_memories():
         # ------------------------------------------------------------------
         # Phase 0: Exact-text dedup across SQLite
         # ------------------------------------------------------------------
-        # The raw chunk written on add_memory() and its derived atomic fact share
-        # the same text but different UUIDs. Phase 2's cosine similarity pass only
-        # sees ChromaDB entries, so it never finds the raw-chunk copy. This pass
-        # finds text duplicates directly in SQLite and drops them, preferring the
-        # ChromaDB-backed (atomic fact) copy over raw-chunk-only copies.
+        # Uses record_type to distinguish atomic facts (in ChromaDB) from raw chunks
+        # (SQLite-only). Prefers keeping the 'fact' record; drops raw-chunk duplicates
+        # and any extra fact copies.
         print("[CONSOLIDATE] Phase 0: Exact-text dedup in SQLite...")
 
-        chroma_all = collection.get(include=[])
-        chroma_id_set = set(chroma_all["ids"])
-
         cursor.execute("""
-            SELECT content, GROUP_CONCAT(id, '|') as ids
+            SELECT content, id, COALESCE(record_type, 'fact') as rt, hit_count
             FROM memories
-            GROUP BY content
-            HAVING COUNT(*) > 1
+            WHERE content IN (
+                SELECT content FROM memories GROUP BY content HAVING COUNT(*) > 1
+            )
+            ORDER BY content
         """)
-        text_dup_groups = cursor.fetchall()
+        content_groups: dict[str, list] = {}
+        for content, id_, rt, hits in cursor.fetchall():
+            content_groups.setdefault(content, []).append((id_, rt, hits))
 
-        for content, ids_str in text_dup_groups:
-            all_ids = ids_str.split("|")
-            in_chroma = [id_ for id_ in all_ids if id_ in chroma_id_set]
-            sqlite_only = [id_ for id_ in all_ids if id_ not in chroma_id_set]
+        for content, entries in content_groups.items():
+            facts = [(id_, hits) for id_, rt, hits in entries if rt == 'fact']
+            raws  = [id_ for id_, rt, hits in entries if rt != 'fact']
 
-            if in_chroma:
-                # Keep the best ChromaDB-backed copy, drop everything else
-                cursor.execute(
-                    f"SELECT id, hit_count FROM memories WHERE id IN ({','.join('?' * len(in_chroma))})",
-                    in_chroma
-                )
-                chroma_rows = sorted(cursor.fetchall(), key=lambda r: r[1], reverse=True)
-                keep_id = chroma_rows[0][0]
-                drop_ids = [r[0] for r in chroma_rows[1:]] + sqlite_only
+            if facts:
+                facts_sorted = sorted(facts, key=lambda x: x[1], reverse=True)
+                keep_id       = facts_sorted[0][0]
+                drop_fact_ids = [e[0] for e in facts_sorted[1:]]
+                drop_ids      = drop_fact_ids + raws
             else:
-                cursor.execute(
-                    f"SELECT id, hit_count FROM memories WHERE id IN ({','.join('?' * len(all_ids))})",
-                    all_ids
-                )
-                rows_sorted = sorted(cursor.fetchall(), key=lambda r: r[1], reverse=True)
-                keep_id = rows_sorted[0][0]
-                drop_ids = [r[0] for r in rows_sorted[1:]]
+                all_sorted    = sorted(entries, key=lambda x: x[2], reverse=True)
+                keep_id       = all_sorted[0][0]
+                drop_ids      = [e[0] for e in all_sorted[1:]]
+                drop_fact_ids = []
 
             if not drop_ids:
                 continue
 
-            chroma_drop = [id_ for id_ in drop_ids if id_ in chroma_id_set]
-            if chroma_drop:
-                collection.delete(ids=chroma_drop)
+            if drop_fact_ids:
+                collection.delete(ids=drop_fact_ids)
+                for cid in drop_fact_ids:
+                    knowledge_graph.remove_fact_reference(cid)
 
             cursor.execute(
                 f"DELETE FROM memories WHERE id IN ({','.join('?' * len(drop_ids))})",
@@ -330,25 +351,19 @@ def consolidate_memories():
             report["merged"] += len(drop_ids)
             print(f"[CONSOLIDATE] Exact-text dedup: dropped {len(drop_ids)} copy/copies of '{content[:60]}'")
 
-        # Re-fetch chroma_id_set after potential deletions above
-        chroma_all = collection.get(include=[])
-        chroma_id_set = set(chroma_all["ids"])
-
         # ------------------------------------------------------------------
         # Phase 1: Prune stale atomic facts (never retrieved, older than N days)
         # ------------------------------------------------------------------
-        # We must only target IDs that exist in ChromaDB (atomic facts), not raw
-        # chunk records — raw chunks never appear in search results so their
-        # hit_count is always 0 but they should not be pruned.
+        # record_type='fact' targets only ChromaDB-backed entries; raw chunks are
+        # excluded since their hit_count is always 0 but they should not be pruned.
         print("[CONSOLIDATE] Phase 1: Pruning stale memories...")
 
         cutoff = (datetime.now() - timedelta(days=PRUNE_AGE_DAYS)).isoformat()
         cursor.execute(
-            "SELECT id FROM memories WHERE hit_count = 0 AND created_at < ?",
+            "SELECT id FROM memories WHERE hit_count = 0 AND created_at < ? AND record_type = 'fact'",
             (cutoff,)
         )
-        stale_candidates = [row[0] for row in cursor.fetchall()]
-        stale_fact_ids = [id_ for id_ in stale_candidates if id_ in chroma_id_set]
+        stale_fact_ids = [row[0] for row in cursor.fetchall()]
 
         if stale_fact_ids:
             collection.delete(ids=stale_fact_ids)
@@ -357,7 +372,9 @@ def consolidate_memories():
                 stale_fact_ids
             )
             sqlite_conn.commit()
-            report["pruned"] = len(stale_fact_ids)
+            for fact_id in stale_fact_ids:
+                knowledge_graph.remove_fact_reference(fact_id)
+            report["pruned"] += len(stale_fact_ids)
             print(f"[CONSOLIDATE] Pruned {len(stale_fact_ids)} stale facts.")
 
         # ------------------------------------------------------------------
@@ -404,6 +421,7 @@ def consolidate_memories():
                         collection.delete(ids=[drop_id])
                         cursor.execute("DELETE FROM memories WHERE id = ?", (drop_id,))
                         sqlite_conn.commit()
+                        knowledge_graph.remove_fact_reference(drop_id)
 
                         merged_out.add(ids[i])
                         merged_out.add(ids[j])
@@ -419,8 +437,11 @@ def consolidate_memories():
                     # Remove both originals
                     collection.delete(ids=[ids[i], ids[j]])
                     cursor.execute("DELETE FROM memories WHERE id IN (?, ?)", (ids[i], ids[j]))
+                    sqlite_conn.commit()
+                    knowledge_graph.remove_fact_reference(ids[i])
+                    knowledge_graph.remove_fact_reference(ids[j])
 
-                    # Add merged fact through the full pipeline so KG triples are re-derived
+                    # Add merged fact (tagged as 'fact' so it's included in future dedup passes)
                     merged_id = str(uuid.uuid4())
                     merged_vec = get_embedding(decision.merged_fact)
                     collection.add(
@@ -429,8 +450,8 @@ def consolidate_memories():
                         ids=[merged_id]
                     )
                     cursor.execute(
-                        "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-                        (merged_id, decision.merged_fact, now, now)
+                        "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
+                        (merged_id, decision.merged_fact, now, now, 'fact')
                     )
                     sqlite_conn.commit()
 
@@ -465,14 +486,15 @@ def consolidate_memories():
 
             collection.delete(ids=[fact_id])
             cursor.execute("DELETE FROM memories WHERE id = ?", (fact_id,))
+            knowledge_graph.remove_fact_reference(fact_id)
 
             for split_fact in decision.split_facts:
                 split_id = str(uuid.uuid4())
                 split_vec = get_embedding(split_fact)
                 collection.add(embeddings=[split_vec], documents=[split_fact], ids=[split_id])
                 cursor.execute(
-                    "INSERT INTO memories (id, content, created_at, last_accessed) VALUES (?, ?, ?, ?)",
-                    (split_id, split_fact, now, now)
+                    "INSERT INTO memories (id, content, created_at, last_accessed, record_type) VALUES (?, ?, ?, ?, ?)",
+                    (split_id, split_fact, now, now, 'fact')
                 )
 
             sqlite_conn.commit()

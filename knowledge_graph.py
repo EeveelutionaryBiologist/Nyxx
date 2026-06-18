@@ -46,14 +46,60 @@ class KnowledgeRelationshipGraph:
             
         return extracted_facts
 
-    def add_relationship(self, subject: str, predicate: str, object_: str):
-        # NetworkX handles duplicates automatically
+    def add_relationship(self, subject: str, predicate: str, object_: str, fact_ids: list[str] | None = None):
         self.G.add_node(subject)
         self.G.add_node(object_)
-        
-        # Add or update the edge with the relationship predicate
-        self.G.add_edge(subject, object_, relation=predicate)
+
+        if self.G.has_edge(subject, object_):
+            # Edge already exists — append new fact_ids to the existing source list.
+            # Predicate is left unchanged (first writer wins).
+            edge_data = self.G[subject][object_]
+            if fact_ids:
+                existing = edge_data.get('source_fact_ids', [])
+                for fid in fact_ids:
+                    if fid not in existing:
+                        existing.append(fid)
+                edge_data['source_fact_ids'] = existing
+        else:
+            self.G.add_edge(
+                subject, object_,
+                relation=predicate,
+                source_fact_ids=list(fact_ids) if fact_ids else []
+            )
+
         self.write_graph()
+
+    def remove_fact_reference(self, fact_id: str) -> int:
+        """
+        Removes fact_id from the source list of every edge that references it.
+        Edges whose source_fact_ids list becomes empty are deleted, and any nodes
+        that become isolated are removed. Returns the number of edges deleted.
+
+        Legacy edges (written before source tracking was added) have no
+        source_fact_ids attribute and are left untouched — they're cleaned up by
+        the degree=0 orphan sweep in the consolidation routine.
+        """
+        for _, _, data in self.G.edges(data=True):
+            source_ids = data.get('source_fact_ids')
+            if source_ids and fact_id in source_ids:
+                source_ids.remove(fact_id)
+
+        edges_to_remove = [
+            (s, t) for s, t, d in self.G.edges(data=True)
+            if d.get('source_fact_ids') == []
+        ]
+
+        for source, target in edges_to_remove:
+            self.G.remove_edge(source, target)
+            if self.G.degree(source) == 0:
+                self.G.remove_node(source)
+            if self.G.degree(target) == 0:
+                self.G.remove_node(target)
+
+        if edges_to_remove:
+            self.write_graph()
+
+        return len(edges_to_remove)
 
     def remove_relationship(self, subject: str, object_: str):
         """Removes an edge, and cleans up orphaned nodes if they are left floating."""

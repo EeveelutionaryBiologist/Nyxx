@@ -73,10 +73,10 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                 response.raise_for_status()
                 memories = response.json().get("results", [])
                 
-                print("ID\tHITS\tCREATED_AT\tTEXT")
-                print("-" * 60)
+                print("ID\tHITS\tTYPE\tCREATED_AT\tTEXT")
+                print("-" * 72)
                 for entry in memories:
-                    print(f"{entry['id'][:8]}...\t{entry['hit_count']}\t{entry['created_at'][:10]}\t{entry['text']}")
+                    print(f"{entry['id'][:8]}...\t{entry['hit_count']}\t{entry.get('record_type','?')}\t{entry['created_at'][:10]}\t{entry['text'][:60]}")
                 print(f"[SYSTEM] Total records: {len(memories)}")
             except Exception as e:
                 print(f"[SYSTEM ERROR] Could not retrieve memories: {e}")
