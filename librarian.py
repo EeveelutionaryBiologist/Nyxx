@@ -8,6 +8,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = BASE_DIR / "Embedding"
 LIBRARIAN_MODEL_PATH = MODEL_DIR / "qwen2.5-3b-instruct-q4_k_m.gguf"
 
+
 # Global variable for the model
 librarian_llm = None
 
@@ -126,3 +127,13 @@ def librarian_summarize(facts: list[str]) -> str:
     )
     
     return response['choices'][0]['message']['content']
+
+def memory_consolidation_routine():
+    """
+    TODO:
+    Periodically runs an analysis on the memory data base to achieve the following: 
+    (1) Remove old AND low-hit (never queried) memories, as well as orphaned nodes in the Knowledge Graph (Subroutine)
+    (2) Merge/eliminate redundant information - i.e. 'Hailey likes marathon running' and 'Hailey does long-distance running'
+    (3) Split convoluted strings of information into concise facts, i.e. 'Hailey enjoys long-distance running and she has three cats, named X, Y, Z' 
+        -> 'Hailey enjoys long-distance running', 'Hailey has three cats', 'Haileys cats are called X, Y, Z'
+    """
