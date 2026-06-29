@@ -1,6 +1,7 @@
 
 from typing import Any
 import datetime
+import json
 
 from base_prompt import BASE_PROMPT
 
@@ -105,7 +106,7 @@ class ContextHandler:
         return self.messages
 
     def dump_chat_log(self):
-        now = datetime.today().strftime('%Y-%m-%d-%H:%M:%S')
+        now = datetime.datetime.today().strftime('%Y-%m-%d-%H:%M:%S')
         log_dir = Path("Logs")
         log_dir.mkdir(parents=True, exist_ok=True)
 
