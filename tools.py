@@ -207,17 +207,41 @@ def tool_commit_to_memory(args: MemoryInputArgs) -> str:
     except Exception as e:
         return f"[ERROR] Failed to save memory: {str(e)}"
 
-def tool_retrieve_memory(args: MemoryQueryArgs) -> str:
+def tool_search_memory(args: MemoryQueryArgs) -> str:
     try:
-        response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": args.query, "top_k": 3})
+        response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": args.query, "top_k": 5})
         response.raise_for_status()
         data = response.json()
-        
-        # Format the output for the LLM, explicitly including the hit counter!
         formatted_results = []
-        for res in data["results"]:
-            formatted_results.append(f"Fact: {res['text']} (Accessed {res['hit_count']} times before)")
-            
+
+        results = data.get("results", [])
+        if not results:
+            return "  (no results)"
+        formatted_results.append(f"  {len(results)} result(s):")
+        for r in results:
+            status = r.get("temporal_status", "?")
+            hits = r.get("hit_count", 0)
+            formatted_results.append(f"    [{status:>9}] [{hits:>3} hits]  {r['text']}")
+        ctx = data.get("relational_context", "").strip()
+        if ctx:
+            formatted_results.append("\n  Relational context:")
+            for line in ctx.splitlines():
+                formatted_results.append(f"    {line}")
+        groups = data.get("entity_groups", {})
+        if groups:
+            formatted_results.append("\n  Entity groups:")
+            for ent, grps in groups.items():
+                formatted_results.append(f"    {ent}: {', '.join(grps)}")
+        temporal = data.get("temporal_context", [])
+        if temporal:
+            formatted_results.append("\n  Temporal context:")
+            for entry in temporal:
+                formatted_results.append(f"    ▶ {entry['current_fact']}")
+                for pred in entry.get("preceded_by", []):
+                    formatted_results.append(f"      └─ {pred['fact']}")
+                    for conc in pred.get("concurrent_with", []):
+                        formatted_results.append(f"           ∥  {conc}")
+               
         return "\n".join(formatted_results)
     except Exception as e:
         return f"[ERROR] Failed to search memory: {str(e)}"

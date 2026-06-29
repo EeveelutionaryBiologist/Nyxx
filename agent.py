@@ -50,7 +50,7 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                     response.raise_for_status()
                     print("[SYSTEM] Database and Knowledge Graph completely wiped.")
                 except Exception as e:
-                    print(f"[SYSTEM ERROR] Failed to wipe memory: {e}")
+                    print(f"[SYSTEM ERROR] Failed to wipe memory: \n{e}")
                     
         case 'consolidate':
             try:
@@ -65,7 +65,7 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                     f"Split: {result.get('split', 0)}"
                 )
             except Exception as e:
-                print(f"[SYSTEM ERROR] Consolidation failed: {e}")
+                print(f"[SYSTEM ERROR] Consolidation failed: \n{e}")
 
         case 'dumpmemory' | 'writememory':
             try:
@@ -79,8 +79,14 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                     print(f"{entry['id'][:8]}...\t{entry['hit_count']}\t{entry.get('record_type','?')}\t{entry['created_at'][:10]}\t{entry['text'][:60]}")
                 print(f"[SYSTEM] Total records: {len(memories)}")
             except Exception as e:
-                print(f"[SYSTEM ERROR] Could not retrieve memories: {e}")
-        case _:
+                print(f"[SYSTEM ERROR] Could not retrieve memories: \n{e}")
+        case 'tokens':
+            try:
+                tokens = context_handler.get_total_tokens()
+                print("[SYSTEM] Estimated tokens used: %s" % tokens)
+            except Exception as e:
+                print(f"[SYSTEM ERROR] Could not get token usage: \n{e}")
+        case _: 
             ok = False
     
     return ok, terminate
@@ -91,6 +97,14 @@ def run_agentic_chat():
     tools = TOOL_LIST
 
     print(f"--- Autonomous Agent Interface Ready ({MODEL_NAME}) ---")
+
+    # Check if memory backend is running:
+    try:
+        _ = requests.post(f"{MEMORY_SERVER_URL}/memory/ping")
+        print(f"[SYSTEM] Connected to Erebus on {MEMORY_SERVER_URL}")
+    except Exception as e:
+        print("[SYSTEM WARNING] Memory Server unreachable. Is Erebus running?")
+    
 
     # ========================================================
     # CORE LOOP STARTS HERE
@@ -117,7 +131,7 @@ def run_agentic_chat():
         # Passive Microservice RAG injection (Hybrid Graph + Vector)
         # ========================================================
         try:
-            response = requests.post(f"{MEMORY_SERVER_URL}/memory/search", json={"query": user_input, "top_k": 5})
+            response = requests.post(f"{MEMORY_SERVER_URL}/memory/context", json={"query": user_input, "top_k": 5})
             if response.status_code == 200:
                 data = response.json()
                 raw_memories = data.get("results", [])
@@ -142,7 +156,7 @@ def run_agentic_chat():
             else:
                 memory_context = ""
         except requests.exceptions.ConnectionError:
-            print("[SYSTEM WARNING] Memory Server unreachable. RAG is currently disabled.")
+            print("[SYSTEM WARNING] Memory Server unreachable. Is Erebus running?")
             memory_context = ""
         except Exception as e:
             print(f"[SYSTEM WARNING] Failed background memory pre-fetch: {e}")
