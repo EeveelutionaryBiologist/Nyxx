@@ -6,7 +6,7 @@ import json
 from multiprocessing import Process, Pipe
 
 from tool_headers import AVAILABLE_ACTIONS
-from tools import MemoryInputArgs
+from tools import MemoryInputArgs, ConvHistorySearchArgs
 
 
 class ToolWorkerInterface:
@@ -72,13 +72,21 @@ def listen_and_execute(pipe_connection):
 
                 # If the model wants to write to persitent DB, intercept here
                 if func_name == "add_persistent_memory":
-                    # Decode what the model wanted to save
                     parsed_args = MemoryInputArgs.model_validate_json(arguments_str)
-                    
-                    # Signal the parent process to do the write operation
                     pipe_connection.send(json.dumps({
-                        "status": "REQUEST_PARENT_WRITE", 
+                        "status": "REQUEST_PARENT_WRITE",
                         "payload": parsed_args.string
+                    }))
+                    continue
+
+                if func_name == "search_conv_history":
+                    parsed_args = ConvHistorySearchArgs.model_validate_json(arguments_str)
+                    pipe_connection.send(json.dumps({
+                        "status": "REQUEST_PARENT_CONV_SEARCH",
+                        "payload": {
+                            "date_hint": parsed_args.date_hint,
+                            "keyword": parsed_args.keyword
+                        }
                     }))
                     continue
 

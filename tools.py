@@ -245,3 +245,18 @@ def tool_search_memory(args: MemoryQueryArgs) -> str:
         return "\n".join(formatted_results)
     except Exception as e:
         return f"[ERROR] Failed to search memory: {str(e)}"
+
+
+class ConvHistorySearchArgs(BaseModel):
+    date_hint: str = Field(
+        description="Time reference for the search. Examples: 'last time', 'last session', 'June 17', 'yesterday', '2026-06-17'. Leave empty string for the most recent session."
+    )
+    keyword: str = Field(
+        default="",
+        description="Optional topic keyword to narrow results (e.g. 'python', 'memory'). Leave empty to retrieve everything from that period."
+    )
+
+
+def tool_search_conv_history(args: ConvHistorySearchArgs) -> str:
+    # Intercepted in toolbox_worker before reaching here; this body is a fallback only.
+    return "[SYSTEM] Conv history search routing error."

@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -9,6 +10,8 @@ from context_handler import ContextHandler
 from tool_headers import TOOL_LIST, AVAILABLE_ACTIONS
 from base_prompt import BASE_PROMPT
 from client import CLIENT, MODEL_NAME
+from RAG import ChromaDBInterface
+from conv_memory import ConversationalMemory
 
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
 
@@ -17,14 +20,26 @@ MAX_LOOP_CYCLES = 8
 
 CURRENT_DIR = Path(os.getcwd())
 
-# The URL where our new Memory Microservice is hosted
+# The URL where Erebus memory microservice is hosted
 MEMORY_SERVER_URL = "http://localhost:8000"
+
+# If this is ON, don't store messages in long term conversational memory
+INCOGNITO_MODE = False
+
+# Unique ID for this running session — used to exclude current-session chunks from retrieval
+SESSION_ID = str(uuid.uuid4())
 
 # ======================================================================
 # Launch worker process from which tool calls are executed
 # ======================================================================
 worker = ToolWorkerInterface(CURRENT_DIR)
 worker.start()
+
+# ======================================================================
+# Initialize local conversational memory (ChromaDB, CPU embedding)
+# ======================================================================
+_chroma_db = ChromaDBInterface()
+conv_mem = ConversationalMemory(_chroma_db, CURRENT_DIR / "Memory" / "metadata.db")
 
 # ======================================================================
 # Main functions
@@ -86,6 +101,14 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                 print("[SYSTEM] Estimated tokens used: %s" % tokens)
             except Exception as e:
                 print(f"[SYSTEM ERROR] Could not get token usage: \n{e}")
+        case 'incognito' | 'anonymous' | 'anon':
+            global INCOGNITO_MODE
+            if INCOGNITO_MODE:
+                INCOGNITO_MODE = False
+                print("[SYSTEM] Incognito mode disengaged.")
+            else:
+                INCOGNITO_MODE = True
+                print("[SYSTEM] Messages will not be logged.")
         case _: 
             ok = False
     
@@ -130,41 +153,55 @@ def run_agentic_chat():
         # ========================================================
         # Passive Microservice RAG injection (Hybrid Graph + Vector)
         # ========================================================
+        memory_blocks = []
+
         try:
             response = requests.post(f"{MEMORY_SERVER_URL}/memory/context", json={"query": user_input, "top_k": 5})
             if response.status_code == 200:
                 data = response.json()
                 raw_memories = data.get("results", [])
                 relational_context = data.get("relational_context", "")
-                
-                memory_blocks = []
-                
-                # 1. Inject Semantic / Vector Facts
+
                 if raw_memories:
                     formatted_mems = [f"- {m['text']} (Hits: {m['hit_count']})" for m in raw_memories]
                     memory_blocks.append("[SEMANTIC MEMORIES]\n" + "\n".join(formatted_mems))
-                
-                # 2. Inject Graph Summaries
+
                 if relational_context:
                     memory_blocks.append("[RELATIONAL KNOWLEDGE]\n" + relational_context.strip())
-                
-                # Combine them cleanly
-                if memory_blocks:
-                    memory_context = "\n\n=== RECALLED CONTEXT ===\n" + "\n\n".join(memory_blocks) + "\n========================"
-                else:
-                    memory_context = ""
-            else:
-                memory_context = ""
         except requests.exceptions.ConnectionError:
             print("[SYSTEM WARNING] Memory Server unreachable. Is Erebus running?")
-            memory_context = ""
         except Exception as e:
             print(f"[SYSTEM WARNING] Failed background memory pre-fetch: {e}")
-            memory_context = ""
 
-        # Append the user input along with the hidden memory context
-        enriched_content = f"{user_input}{memory_context}"
-        context_handler.append_messages({"role": "user", "content": enriched_content})
+        # ========================================================
+        # Local conversational memory retrieval (independent of Erebus)
+        # ========================================================
+        if not INCOGNITO_MODE:
+            try:
+                conv_results = conv_mem.retrieve_similar(user_input, top_k=5, current_session_id=SESSION_ID)
+                if conv_results:
+                    lines = [
+                        f"- [{r['source']}, {r['created_at'][:10]}, topic: {r['topic']}] \"{r['text'][:200]}\""
+                        for r in conv_results
+                    ]
+                    memory_blocks.append("[PAST CONVERSATION EXCERPTS]\n" + "\n".join(lines))
+            except Exception as e:
+                print(f"[SYSTEM WARNING] Conv memory retrieval failed: {e}")
+
+        # Combine all recalled context into a single ephemeral block
+        ephemeral_context = (
+            "\n\n=== RECALLED CONTEXT ===\n" + "\n\n".join(memory_blocks) + "\n========================"
+        ) if memory_blocks else ""
+
+        # Store only the clean user input in context history (not the enriched version)
+        context_handler.append_messages({"role": "user", "content": user_input})
+
+        # Persist user turn to local conversational memory
+        if not INCOGNITO_MODE:
+            try:
+                conv_mem.store_chunk(user_input, "user", SESSION_ID)
+            except Exception as e:
+                print(f"[SYSTEM WARNING] Conv memory write failed: {e}")
 
         # ========================================================
         # Dispatch messages to Black Box model, handle response
@@ -175,12 +212,14 @@ def run_agentic_chat():
             cycle_count += 1
             
             # Request inference with current message history state
+            # ephemeral_context is injected only for this call and not stored in history
             response = CLIENT.chat.completions.create(
                 model=MODEL_NAME,
-                messages=context_handler.get_messages_for_inference(),
+                messages=context_handler.get_messages_for_inference(ephemeral_context=ephemeral_context),
                 tools=tools,
                 tool_choice="auto"
             )
+            ephemeral_context = ""  # Only inject on the first cycle; tool results handle subsequent context
             
             response_message = response.choices[0].message
             
@@ -188,6 +227,11 @@ def run_agentic_chat():
             if not response_message.tool_calls:
                 print(f"AI: {response_message.content}\n")
                 context_handler.append_messages(response_message)
+                if not INCOGNITO_MODE and response_message.content:
+                    try:
+                        conv_mem.store_chunk(response_message.content, "assistant", SESSION_ID)
+                    except Exception as e:
+                        print(f"[SYSTEM WARNING] Conv memory write failed: {e}")
                 break  # Exit the recursion loop, pass control back to the human 'input'
                 
             # Recursive Case: Model wants to execute one or many tools
@@ -220,6 +264,15 @@ def run_agentic_chat():
                         action_result = f"[SUCCESS] Fact successfully committed to Memory Microservice."
                     except Exception as e:
                         action_result = f"[SYSTEM ERROR] Failed database write: {e}"
+                elif response_payload["status"] == "REQUEST_PARENT_CONV_SEARCH":
+                    payload = response_payload["payload"]
+                    try:
+                        action_result = conv_mem.retrieve_by_time(
+                            date_hint=payload.get("date_hint", ""),
+                            keyword=payload.get("keyword", "")
+                        )
+                    except Exception as e:
+                        action_result = f"[ERROR] Conversational history search failed: {e}"
                 else:
                     action_result = f"[PROCESS ISOLATION ERROR]: {response_payload['message']}"
 
@@ -229,6 +282,7 @@ def run_agentic_chat():
                         "name": func_name,
                         "content": action_result
                     })
+
         else:
             # Executes only if the loop hits MAX_LOOP_CYCLES without breaking cleanly
             warning_msg = "[SYSTEM] Warning - Throttled! Agent exceeded max autonomous thinking steps safety cap."

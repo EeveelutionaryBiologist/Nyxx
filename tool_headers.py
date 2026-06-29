@@ -11,7 +11,8 @@ AVAILABLE_ACTIONS = {
     "bash_command": (tool_execute_bash_command, BashCommandArgs),
     "search_web": (tool_web_search, WebSearchArgs),
     "search_memory": (tool_search_memory, MemoryQueryArgs),
-    "add_persistent_memory": (tool_commit_to_memory, MemoryInputArgs)
+    "add_persistent_memory": (tool_commit_to_memory, MemoryInputArgs),
+    "search_conv_history": (tool_search_conv_history, ConvHistorySearchArgs)
 }
 
 
@@ -86,6 +87,14 @@ TOOL_LIST = [
                 "name": "add_persistent_memory",
                 "description": "Add a string to permament memory using the RAG backend. IMPORTANT: Should be phrased in a concise way. Convoluted facts may be broken up into multiple simpler facts/ tool calls.",
                 "parameters": MemoryInputArgs.model_json_schema()
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_conv_history",
+                "description": "Search past conversation history by date or recency. Use this when the user asks what was discussed in a previous session, on a specific date, or 'last time'. Returns a formatted transcript excerpt.",
+                "parameters": ConvHistorySearchArgs.model_json_schema()
             }
         }
     ]

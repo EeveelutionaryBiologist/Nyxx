@@ -1,5 +1,6 @@
 
 from typing import Any
+from pathlib import Path
 import datetime
 import json
 
@@ -102,8 +103,15 @@ class ContextHandler:
         except Exception as e:
             print(f"[SYSTEM WARNING] Historical distillation routine failed: {e}")
 
-    def get_messages_for_inference(self):
-        return self.messages
+    def get_messages_for_inference(self, ephemeral_context: str = "") -> list:
+        if not ephemeral_context:
+            return self.messages
+        msgs = [m.copy() for m in self.messages]
+        for i in reversed(range(len(msgs))):
+            if msgs[i].get("role") == "user":
+                msgs[i] = {**msgs[i], "content": msgs[i]["content"] + ephemeral_context}
+                break
+        return msgs
 
     def dump_chat_log(self):
         now = datetime.datetime.today().strftime('%Y-%m-%d-%H:%M:%S')
