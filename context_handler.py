@@ -5,6 +5,7 @@ import datetime
 import json
 
 from base_prompt import BASE_PROMPT
+from client import CLIENT, MODEL_NAME
 
 MAX_CONTEXT_TOKENS = 16384
 TRIGGER_SUMMARY_TOKENS = int(MAX_CONTEXT_TOKENS * 0.8)  
@@ -57,49 +58,71 @@ class ContextHandler:
         print("[SYSTEM] Context cleared")
 
     def distill_older_context(self):
-        """
-        Compresses the oldest 40% of conversational history into an 
-        orderly 'System Summary' directive block to preserve context space.
-        """
         print("\n[SYSTEM] Context threshold crossed. Compressing historical log...")
-        
-        # Keep system prompt [0] and preserve the most recent 5 messages intact
+
         preserve_count = 5
         if len(self.messages) <= preserve_count + 2:
             return
-            
-        compress_slice = self.messages[1:-preserve_count]
-        retained_slice = self.messages[-preserve_count:]
-        
-        summary_instruction = (
-            "You are an internal system routine. Summarize the following dialogue sequence. "
-            "Extract critical user data, constants, completed goals, and persistent settings. "
-            "Be ultra-dense, clear, and omit conversational pleasantries."
-            "YOU are the one who has to read it in the end."
+
+        # Walk forward from the raw tail until we hit a clean turn boundary —
+        # avoids leaving an orphaned tool-result message with no preceding tool_calls.
+        raw_retained = self.messages[-preserve_count:]
+        retained_slice = raw_retained  # fallback
+        for i, msg in enumerate(raw_retained):
+            role = msg.get("role")
+            if role == "user" or (role == "assistant" and not msg.get("tool_calls")):
+                retained_slice = raw_retained[i:]
+                break
+
+        cut = len(self.messages) - len(retained_slice)
+
+        # Detect a pinned summary block from a prior compression pass
+        has_prior_summary = (
+            len(self.messages) > 1
+            and self.messages[1].get("role") == "system"
+            and "[HISTORICAL ARCHIVE SUMMARY]" in (self.messages[1].get("content") or "")
         )
-        
+
+        if has_prior_summary:
+            prior_summary = self.messages[1].get("content", "")
+            compress_slice = self.messages[2:cut]
+            summary_instruction = (
+                "You are an internal system routine. A prior summary exists. "
+                "Integrate the new dialogue into it, producing one updated ultra-dense summary. "
+                "Preserve all facts from the prior summary unless directly contradicted. "
+                "Stay under 300 words.\n"
+                "YOU are the one who has to read it in the end."
+            )
+            compress_input = f"[PRIOR SUMMARY]\n{prior_summary}\n\n[NEW DIALOGUE]\n" + json.dumps(compress_slice)
+        else:
+            compress_slice = self.messages[1:cut]
+            summary_instruction = (
+                "You are an internal system routine. Summarize the following dialogue sequence. "
+                "Extract critical user data, constants, completed goals, and persistent settings. "
+                "Be ultra-dense and clear; omit pleasantries. Stay under 300 words.\n"
+                "YOU are the one who has to read it in the end."
+            )
+            compress_input = json.dumps(compress_slice)
+
+        if not compress_slice:
+            return
+
         try:
-            # Execute summary pass using your active engine
             summary_response = CLIENT.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": summary_instruction},
-                    {"role": "user", "content": json.dumps(compress_slice)}
+                    {"role": "user", "content": compress_input}
                 ],
-                temperature=0.1 # Low variance for exact details extraction
+                temperature=0.1
             )
-            
             summary_text = summary_response.choices[0].message.content
-            
-            # Reconstruct history: Base System -> Summary Block -> Retained Context
             summary_message = {
-                "role": "system", 
+                "role": "system",
                 "content": f"[HISTORICAL ARCHIVE SUMMARY]:\n{summary_text}"
             }
-            
             self.messages = [self.messages[0], summary_message] + retained_slice
-            print(f"[SYSTEM] Compression successful. New Context Size: {self.get_total_tokens()} tokens.\n")
-            
+            print(f"[SYSTEM] Compression complete. New context size: {self.get_total_tokens()} tokens.\n")
         except Exception as e:
             print(f"[SYSTEM WARNING] Historical distillation routine failed: {e}")
 
