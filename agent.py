@@ -97,7 +97,7 @@ def parse_system_prompt(user_input: str, context_handler: ContextHandler) -> tup
                 print(f"[SYSTEM ERROR] Could not retrieve memories: \n{e}")
         case 'tokens':
             try:
-                tokens = context_handler.get_total_tokens()
+                tokens = context_handler.get_consumed_tokens()
                 print("[SYSTEM] Estimated tokens used: %s" % tokens)
             except Exception as e:
                 print(f"[SYSTEM ERROR] Could not get token usage: \n{e}")

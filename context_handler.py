@@ -7,7 +7,7 @@ import json
 from base_prompt import BASE_PROMPT
 from client import CLIENT, MODEL_NAME
 
-MAX_CONTEXT_TOKENS = 16384
+MAX_CONTEXT_TOKENS = 32768 
 TRIGGER_SUMMARY_TOKENS = int(MAX_CONTEXT_TOKENS * 0.8)  
 
 class ContextHandler:
@@ -15,6 +15,8 @@ class ContextHandler:
         self.messages = [
             {"role": "system", "content": BASE_PROMPT}
         ]
+        self.consumed_tokens = 0
+        self.current_messages_tokens = 0
 
     def estimate_tokens(self, message: dict) -> int:
         """
@@ -35,6 +37,9 @@ class ContextHandler:
 
     def get_total_tokens(self) -> int:
         return sum(self.estimate_tokens(msg) for msg in self.messages)
+    
+    def get_consumed_tokens(self) -> int:
+        return self.consumed_tokens 
 
     def append_messages(self, message: Any):
         """Standardizes input messages into clean dictionaries before storage."""
@@ -47,10 +52,15 @@ class ContextHandler:
             msg_dict = {"role": "assistant", "content": str(message)}
             
         self.messages.append(msg_dict)
+
+        tokens = self.estimate_tokens(msg_dict)
+        self.current_messages_tokens += tokens
+        self.consumed_tokens += tokens
         
         # Check if we need to compress history
-        if self.get_total_tokens() > TRIGGER_SUMMARY_TOKENS:
+        if self.current_messages_tokens > TRIGGER_SUMMARY_TOKENS:
             self.distill_older_context()
+            self.current_messages_tokens = self.get_total_tokens()
 
     def clear(self):
         self.messages.clear()
