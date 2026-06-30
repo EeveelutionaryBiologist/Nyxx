@@ -16,7 +16,7 @@ from conv_memory import ConversationalMemory
 TEMPERATURE = 0.5 # Global temp setting, Not used for now
 
 # Safety throttle: Prevent a model from getting stuck in an infinite tool-calling loop
-MAX_LOOP_CYCLES = 8
+MAX_LOOP_CYCLES = 16
 
 CURRENT_DIR = Path(os.getcwd())
 
