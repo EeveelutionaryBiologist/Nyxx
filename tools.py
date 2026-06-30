@@ -13,7 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from openai import OpenAI
 from typing import Any
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # from RAG import db_retrieve, add_chunk_to_db
 
@@ -193,7 +193,7 @@ def tool_execute_bash_command(args: BashCommandArgs) -> str:
 def tool_web_search(args: WebSearchArgs) -> str:
     try:
         with DDGS() as ddgs:
-            results = [r for r in ddgs.text(args.query, max_results=5)]
+            results = [r for r in ddgs.text(args.query, max_results=12)]
         return json.dumps(results, indent=2)
     except Exception as e:
         return f"Error executing web search: {str(e)}"
