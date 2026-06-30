@@ -282,7 +282,6 @@ def run_agentic_chat():
                         "name": func_name,
                         "content": action_result
                     })
-
         else:
             # Executes only if the loop hits MAX_LOOP_CYCLES without breaking cleanly
             warning_msg = "[SYSTEM] Warning - Throttled! Agent exceeded max autonomous thinking steps safety cap."
