@@ -8,6 +8,7 @@ import subprocess
 import ast
 import operator as op
 import requests
+import re
 
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -56,9 +57,15 @@ class BashCommandArgs(BaseModel):
 
 class WebSearchArgs(BaseModel):
     query: str = Field(description="A specific, optimized search query to lookup on the internet.")
+    max_results: int = Field(default=12, description="Number of results to return (1–50).")
+    time_range: str = Field(default="", description="Time filter: '' (any), 'd' (day), 'w' (week), 'm' (month), 'y' (year).")
+    region: str = Field(default="wt-wt", description="Region code e.g. 'us-en', 'de-de', 'wt-wt' (worldwide).")
+    safesearch: str = Field(default="moderate", description="SafeSearch level: 'on', 'moderate', 'off'.")
+    fetch_content: bool = Field(default=False, description="Whether to fetch full page text for top results.")
+    fetch_max_pages: int = Field(default=3, description="Max pages to scrape when fetch_content=True.")
 
 class MemoryInputArgs(BaseModel):
-    string: str = Field(description="Information to be retained in permanent memory for later context enrichment (RAG). Should be phrased in a concise way. NOTE: Convoluted facts may be broken up into multiple simpler facts/ tool calls.")
+    string: str = Field(description="Information to be permanently committed to memory (RAG). Should be phrased concisely. NOTE: Convoluted facts may be broken into simpler facts / multiple calls.")
 
 class MemoryQueryArgs(BaseModel):
     query: str = Field(description="Query to search in local RAG data base.")
@@ -107,8 +114,6 @@ def tool_read_file(args: FileReadArgs) -> str:
 
 
 def tool_write_file(args: FileWriterArgs) -> str:
-    # if not os.path.exists(os.pardir(args.filepath)):
-    #     return f"Error: Parent directory not available."
     try: 
         with open(args.filepath, 'w') as f:
             f.write(args.content)
@@ -147,7 +152,6 @@ def tool_extract_image_info(args: ImageAnalyzerArgs) -> str:
         image_data_url = f"data:{mime_type};base64,{base64_string}"
 
         # 4. Re-instantiate a dedicated local sub-client tracking your configuration
-        # Make sure 'client' or your API parameters are within scope here
         sub_response = CLIENT.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -190,13 +194,108 @@ def tool_execute_bash_command(args: BashCommandArgs) -> str:
         return "Error: Command timed out after 10 seconds."
 
 
+# ──────────────────────────────────────────────────
+# Web Search Helpers
+# ──────────────────────────────────────────────────
+
+# TODO: Add valid entries here
+_SPAM_DOMAINS = {
+    "example-spam.com", "clickbait.example",
+    "bestdeals.today", "free-downloads.xyz",
+}
+
+
+def _fetch_page_text(url: str, timeout: int = 5) -> str | None:
+    """Fetch a URL and extract readable text (basic HTML tag stripping)."""
+    try:
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        resp.raise_for_status()
+        # Strip HTML tags, collapse whitespace, cap at 2k chars
+        text = re.sub(r"<[^>]+>", " ", resp.text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:2000]
+    except Exception:
+        return None
+
+
+def _filter_results(results: list[dict]) -> list[dict]:
+    """Remove known spam / low-quality domains."""
+    return [
+        r
+        for r in results
+        if not any(domain in r.get("href", "") for domain in _SPAM_DOMAINS)
+    ] or results  # fallback to original if everything filtered out
+
+
+def _format_results(results: list[dict], fetch_content: bool = False) -> str:
+    """Format raw DDG results into clean human-readable output."""
+    if not results:
+        return "  (no results found)"
+
+    lines = [f"🔍 **{len(results)} result(s) found:**\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "No title")
+        href = r.get("href", "N/A")
+        snippet = (r.get("body") or "")[:300]
+
+        lines.append(f"  **[{i}]** {title}")
+        lines.append(f"       🔗 {href}")
+        if snippet:
+            lines.append(f"       └─ {snippet}{'...' if len(r.get('body', '')) > 300 else ''}")
+        if fetch_content and r.get("full_text"):
+            ft = r["full_text"]
+            lines.append(f"       📄 *Page excerpt:* {ft[:400]}{'...' if len(ft) > 400 else ''}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def tool_web_search(args: WebSearchArgs) -> str:
     try:
         with DDGS() as ddgs:
-            results = [r for r in ddgs.text(args.query, max_results=12)]
-        return json.dumps(results, indent=2)
+            raw_results = list(
+                ddgs.text(
+                    args.query,
+                    region=args.region,
+                    safesearch=args.safesearch,
+                    timelimit=args.time_range if args.time_range else None,
+                    max_results=min(args.max_results, 50),
+                )
+            )
+
+        if not raw_results:
+            return f"🔍 No results found for query: '{args.query}'. Try broader terms."
+
+        # Post-filter spam / low-quality domains
+        results = _filter_results(raw_results)
+
+        # Optionally fetch full page text for top results
+        if args.fetch_content and results:
+            for r in results[: min(args.fetch_max_pages, len(results))]:
+                full_text = _fetch_page_text(r["href"])
+                if full_text:
+                    r["full_text"] = full_text
+
+        return _format_results(results, fetch_content=args.fetch_content)
+
     except Exception as e:
-        return f"Error executing web search: {str(e)}"
+        err = str(e).lower()
+        if "ratelimit" in err or "429" in err:
+            return "⚠️ **Rate limited!** The search backend is throttling us. Wait a moment and retry."
+        elif "timeout" in err:
+            return "⏱️ **Search timed out.** The backend might be slow right now."
+        else:
+            return f"💥 **Error executing web search:** {e}"
 
 
 def tool_commit_to_memory(args: MemoryInputArgs) -> str:
@@ -206,6 +305,7 @@ def tool_commit_to_memory(args: MemoryInputArgs) -> str:
         return "[SUCCESS] Information has been permanently committed to memory."
     except Exception as e:
         return f"[ERROR] Failed to save memory: {str(e)}"
+
 
 def tool_search_memory(args: MemoryQueryArgs) -> str:
     try:
