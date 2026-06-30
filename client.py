@@ -19,14 +19,15 @@ def load_environment_dict() -> str:
 def initialize_client():
     env = load_environment_dict()
 
-    for provider in ["GEMINI", "OPENAI", "ANTHROPIC"]:
+    for provider in ["GEMINI", "OPENAI", "ANTHROPIC", "DEEPSEEK"]:
         api_key = env.get(f"{provider}_API_KEY", "")
 
         if len(api_key) == 0:
             continue
 
-        base_url = env.get(provider).get("BASE_URL")
-        model = env.get(provider).get("MODEL_NAME")
+        provider_config = env.get(provider)
+        base_url = provider_config.get("BASE_URL")
+        model = provider_config.get("MODEL_NAME")
 
         try:
             client = OpenAI(
@@ -35,11 +36,10 @@ def initialize_client():
             )
             return client, model
         except Exception as e:
-            print(f"[ERROR] Could not open client: \n{e}")
+            print(f"[ERROR] Could not open client for {provider}: \n{e}")
             continue
     
-    # Alternatively, use local model as default
-    # TODO: Make switching of local models more intuitive
+    # Alternatively, use local model as default fallback
     base_url = env.get("OLLAMA").get("BASE_URL")
     model = env.get("OLLAMA").get("MODEL_NAME")
 
